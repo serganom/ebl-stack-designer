@@ -75,6 +75,12 @@ Using the launcher:
 ./run_ebl_stack_designer.sh
 ```
 
+Or on macOS by double-clicking:
+
+```bash
+run_ebl_stack_designer.command
+```
+
 Or directly:
 
 ```bash
