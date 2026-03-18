@@ -1,0 +1,114 @@
+# Physics Notes
+
+This document summarizes the physics approximations used in `ebl_stack_designer.py`.
+
+## 1. Material Model
+
+Each material is defined by:
+
+- density `rho` in `g/cm^3`
+- elemental list with `Z`
+- weight fraction
+- atomic fraction
+
+From this, the code derives:
+
+- effective atomic number `Z_eff`
+- effective atomic weight `A_eff`
+- Bragg-style compound stopping data
+- compound mean ionization energy
+
+Approximate ionization-energy relation:
+
+`J(eV) = 9.76 Z + 58.8 Z^-0.19`
+
+For compounds, a Bragg-type logarithmic mixing rule is used.
+
+## 2. Electron Transport Scale
+
+The transport length scale follows an `E^1.67` style range dependence motivated by Kanaya-Okayama / Kyser-Murata type electron-range scaling.
+
+This is used to construct an effective elastic mean free path.
+
+## 3. Elastic Scattering
+
+Angular deflection uses a screened Rutherford-inspired inversion:
+
+`cos(theta) = 1 - 2 alpha R / (1 + alpha - R)`
+
+with
+
+`alpha ~ 3.4e-3 Z^0.67 / E`
+
+where `R` is a uniform random number and `E` is the electron energy in `keV`.
+
+This keeps the code lightweight while still producing physically sensible growth of scattering with higher `Z` and lower `E`.
+
+## 4. Continuous Energy Loss
+
+Stopping is based on a Joy-Luo / modified Bethe style form with Bragg additivity:
+
+`-dE/dS = rho * sum_i [ w_i * 7.85e-3 * Z_i / (A_i E) * ln(1.166 * (E + 0.85 J_i) / J_i ) ]`
+
+in code units of `keV / nm`.
+
+This term is blended with a simple CSDA-like range-derived term to avoid unphysical behavior across the full operating range.
+
+## 5. Energy Deposition
+
+Deposited energy is accumulated inside the selected resist layer as a radial histogram.
+
+Instead of dumping the whole segment energy at a single endpoint, the code subdivides the lateral segment and distributes energy along it. This reduces center-bias artifacts in the histogram.
+
+## 6. PEC / PSF Fitting
+
+### Double-Gaussian
+
+Standard PEC fit:
+
+`PSF(r) = [ G(alpha) + eta G(beta) ] / (1 + eta)`
+
+where
+
+`G(sigma) = exp(-r^2 / sigma^2)`
+
+with normalization applied numerically over the sampled radial bins.
+
+This is the conventional EBL PEC representation used in many older and current workflows.
+
+### Power-Gaussian Composite
+
+For high-voltage and thin-resist conditions, the code also tests a composite model:
+
+`PSF(r) = [ P(alpha_p) + eta G(beta) ] / (1 + eta)`
+
+where
+
+`P(alpha_p) ~ r^(-alpha_p)`
+
+after numerical normalization on the fit domain.
+
+This model direction is motivated by recent literature showing that a pure double-Gaussian description may be too restrictive for some high-energy scattering distributions.
+
+## 7. Model Selection
+
+Both candidate models are fit on the same histogram window.
+
+The program prefers the power-Gaussian model in high-voltage / thin-resist regimes, but still compares the fit error and can fall back to the double-Gaussian model if it is clearly better.
+
+## 8. Scope
+
+This is an engineering approximation for rapid PEC exploration inside a GUI workflow.
+
+It should be treated as:
+
+- useful for stack comparison
+- useful for early PEC parameter estimation
+- useful for educational and exploratory work
+
+It should not be treated as:
+
+- a replacement for calibrated full Monte Carlo engines
+- a substitute for measured process calibration
+- a process-certified production model
+
