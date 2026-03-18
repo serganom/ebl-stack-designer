@@ -2,17 +2,30 @@ import json
 import math
 import time
 import random
+import sys
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 np = None
 plt = None
 
 
+def _dependency_install_command():
+    return f'"{sys.executable}" -m pip install numpy matplotlib'
+
+
 def _ensure_numpy():
     global np
     if np is None:
-        import numpy as _np
-        np = _np
+        try:
+            import numpy as _np
+            np = _np
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "NumPy is not installed for the Python interpreter running this app.\n\n"
+                f"Current Python:\n{sys.executable}\n\n"
+                "Install the dependencies with:\n"
+                f"{_dependency_install_command()}"
+            ) from exc
     return np
 
 
@@ -22,6 +35,8 @@ def _ensure_matplotlib_pyplot():
         try:
             import matplotlib.pyplot as _plt
             plt = _plt
+        except ModuleNotFoundError:
+            plt = False
         except Exception:
             plt = False
     return None if plt is False else plt
