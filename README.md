@@ -81,6 +81,17 @@ Or directly:
 python3 ebl_stack_designer.py
 ```
 
+macOS note:
+
+- on some macOS installations, `/usr/bin/python3` is not suitable for this GUI app
+- if that happens, use the python.org Framework build instead, for example:
+
+```bash
+/Library/Frameworks/Python.framework/Versions/3.12/bin/python3 ebl_stack_designer.py
+```
+
+- the bundled launcher script now prefers a Python interpreter with working `tkinter`
+
 ## Basic Workflow
 
 1. Add or import materials.
@@ -116,4 +127,3 @@ This folder is prepared to be a clean GitHub repository. After creating a GitHub
 git remote add origin <YOUR_GITHUB_REPO_URL>
 git push -u origin main
 ```
-
