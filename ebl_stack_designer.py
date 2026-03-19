@@ -665,6 +665,9 @@ class StackDesignerApp:
         self._current_unit_last = "pA"
         self._stack_drag_src_iid = None
         self._stack_drag_active = False
+        self._sim_progress_win = None
+        self._sim_progress_stage_var = tk.StringVar(value="")
+        self._sim_progress_detail_var = tk.StringVar(value="")
 
         self.project = {
             "project_name": "New EBL Stack",
@@ -1619,14 +1622,20 @@ class StackDesignerApp:
         old_cursor = self.root.cget("cursor")
         t0 = time.time()
         self.sim_progress_var.set(0.0)
-        self.workflow_hint_var.set(
-            f"Running standalone Monte Carlo simulation... 0/{params['electrons']} electrons, ETA { _format_duration_compact(float('nan')) }"
+        self._open_sim_progress_window(params["electrons"])
+        self._set_sim_progress_text(
+            "Running standalone Monte Carlo simulation...",
+            0,
+            params["electrons"],
+            t0,
+            collision_count=0,
         )
         try:
             self.root.config(cursor="watch")
             self.root.update_idletasks()
             sim = self._simulate_standalone_radial_distribution(params)
             self.sim_progress_var.set(100.0)
+            self._set_sim_progress_message("Standalone simulation done. Fitting αβη...")
             self.workflow_hint_var.set("Standalone simulation done. Fitting αβη...")
             self.root.update_idletasks()
             res = self._fit_alpha_beta_eta_from_histogram(
@@ -1664,8 +1673,10 @@ class StackDesignerApp:
         except Exception as exc:
             messagebox.showerror("Standalone Sim + Fit", str(exc))
             self.workflow_hint_var.set("Standalone simulation failed.")
+            self._set_sim_progress_message("Standalone simulation failed.")
             self.sim_progress_var.set(0.0)
         finally:
+            self._close_sim_progress_window()
             self.root.config(cursor=old_cursor)
             self.root.update_idletasks()
 
@@ -1871,13 +1882,12 @@ class StackDesignerApp:
                 rate = done / elapsed_s if elapsed_s > 1e-9 else 0.0
                 eta_s = (ne - done) / rate if rate > 1e-9 else float("nan")
                 frac = done / ne if ne > 0 else 0.0
-                self.sim_progress_var.set(100.0 * frac)
-                self.workflow_hint_var.set(
-                    "Standalone MC: "
-                    f"{done}/{ne} electrons ({100.0 * frac:.1f}%), "
-                    f"collisions={collision_count_in_resist}, "
-                    f"elapsed={_format_duration_compact(elapsed_s)}, "
-                    f"ETA={_format_duration_compact(eta_s)}"
+                self._set_sim_progress_text(
+                    "Standalone MC",
+                    done,
+                    ne,
+                    progress_t0,
+                    collision_count=collision_count_in_resist,
                 )
                 self.root.update_idletasks()
 
@@ -2140,6 +2150,85 @@ class StackDesignerApp:
         ttk.Button(btns, text="Close", command=win.destroy).pack(side="right")
         win.bind("<Escape>", lambda _e: win.destroy())
         return win
+
+    def _open_sim_progress_window(self, total_electrons):
+        if self._sim_progress_win is not None and self._sim_progress_win.winfo_exists():
+            self._sim_progress_win.deiconify()
+            self._sim_progress_win.lift()
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Simulation Progress")
+        _configure_toplevel(win, self.root, width=560, height=180, min_width=460, min_height=160)
+        win.attributes("-topmost", True)
+        win.protocol("WM_DELETE_WINDOW", lambda: win.withdraw())
+
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill="both", expand=True)
+        frm.columnconfigure(0, weight=1)
+
+        ttk.Label(frm, text="Monte Carlo progress", font=("Helvetica", 13, "bold")).grid(
+            row=0, column=0, sticky="w", pady=(0, 6)
+        )
+        ttk.Label(frm, textvariable=self._sim_progress_stage_var, foreground="#333").grid(
+            row=1, column=0, sticky="w"
+        )
+        ttk.Progressbar(
+            frm,
+            orient="horizontal",
+            mode="determinate",
+            maximum=100.0,
+            variable=self.sim_progress_var,
+        ).grid(row=2, column=0, sticky="ew", pady=8)
+        ttk.Label(
+            frm,
+            textvariable=self._sim_progress_detail_var,
+            foreground="#444",
+            justify="left",
+        ).grid(row=3, column=0, sticky="w")
+        ttk.Label(frm, text=f"Target electrons: {total_electrons}", foreground="#666").grid(
+            row=4, column=0, sticky="w", pady=(8, 0)
+        )
+
+        self._sim_progress_win = win
+        win.lift()
+
+    def _set_sim_progress_message(self, message):
+        self._sim_progress_stage_var.set(message)
+        self._sim_progress_detail_var.set("")
+        self.workflow_hint_var.set(message)
+        if self._sim_progress_win is not None and self._sim_progress_win.winfo_exists():
+            self._sim_progress_win.update_idletasks()
+
+    def _set_sim_progress_text(self, stage, done, total, start_time, collision_count=None):
+        elapsed_s = max(0.0, time.time() - start_time)
+        frac = (done / total) if total > 0 else 0.0
+        rate = (done / elapsed_s) if elapsed_s > 1e-9 else 0.0
+        eta_s = ((total - done) / rate) if rate > 1e-9 else float("nan")
+        collision_txt = "" if collision_count is None else f", collisions={collision_count}"
+        header_text = (
+            f"{stage}: {done}/{total} electrons ({100.0 * frac:.1f}%), "
+            f"ETA={_format_duration_compact(eta_s)}"
+        )
+        detail_text = (
+            f"Elapsed: {_format_duration_compact(elapsed_s)}   "
+            f"Speed: {rate:.1f} e-/s   "
+            f"Remaining: {_format_duration_compact(eta_s)}"
+            f"{collision_txt}"
+        )
+        self.sim_progress_var.set(100.0 * frac)
+        self._sim_progress_stage_var.set(header_text)
+        self._sim_progress_detail_var.set(detail_text)
+        self.workflow_hint_var.set(header_text)
+        if self._sim_progress_win is not None and self._sim_progress_win.winfo_exists():
+            self._sim_progress_win.deiconify()
+            self._sim_progress_win.lift()
+            self._sim_progress_win.update_idletasks()
+
+    def _close_sim_progress_window(self):
+        if self._sim_progress_win is not None and self._sim_progress_win.winfo_exists():
+            self._sim_progress_win.destroy()
+        self._sim_progress_win = None
 
     def _show_fit_result_dialog(self, res):
         msg = (
