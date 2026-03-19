@@ -502,6 +502,17 @@ def _create_scrolled_body(parent, padding=10):
     return shell, body, canvas
 
 
+def _format_duration_compact(seconds):
+    if seconds is None or not math.isfinite(seconds) or seconds < 0:
+        return "--:--"
+    total = int(round(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
 class ElementRow:
     def __init__(self, parent, remove_callback):
         self.frame = ttk.Frame(parent)
@@ -678,12 +689,14 @@ class StackDesignerApp:
         header.grid(row=0, column=0, sticky="ew")
         for i in range(9):
             header.columnconfigure(i, weight=0)
+        header.columnconfigure(1, weight=1)
 
         self.project_name_var = tk.StringVar()
         self.energy_var = tk.StringVar()
         self.diam_var = tk.StringVar()
         self.current_var = tk.StringVar()
         self.current_unit_var = tk.StringVar(value="pA")
+        self.sim_progress_var = tk.DoubleVar(value=0.0)
         self.workflow_hint_var = tk.StringVar(
             value="Workflow: 1) Import presets  2) Build stack  3) Rutherford/Bethe MC + adaptive PSF fit  4) Plot / Save results"
         )
@@ -704,6 +717,13 @@ class StackDesignerApp:
         ttk.Label(header, textvariable=self.workflow_hint_var, foreground="#444").grid(
             row=1, column=0, columnspan=9, sticky="w", padx=4, pady=(2, 4)
         )
+        ttk.Progressbar(
+            header,
+            orient="horizontal",
+            mode="determinate",
+            maximum=100.0,
+            variable=self.sim_progress_var,
+        ).grid(row=2, column=0, columnspan=9, sticky="ew", padx=4, pady=(0, 4))
 
         actions = ttk.LabelFrame(main, text="Actions")
         actions.grid(row=1, column=0, sticky="ew", pady=(8, 4))
@@ -1598,11 +1618,15 @@ class StackDesignerApp:
     def _run_standalone_mc_job(self, params):
         old_cursor = self.root.cget("cursor")
         t0 = time.time()
-        self.workflow_hint_var.set("Running standalone Monte Carlo simulation...")
+        self.sim_progress_var.set(0.0)
+        self.workflow_hint_var.set(
+            f"Running standalone Monte Carlo simulation... 0/{params['electrons']} electrons, ETA { _format_duration_compact(float('nan')) }"
+        )
         try:
             self.root.config(cursor="watch")
             self.root.update_idletasks()
             sim = self._simulate_standalone_radial_distribution(params)
+            self.sim_progress_var.set(100.0)
             self.workflow_hint_var.set("Standalone simulation done. Fitting αβη...")
             self.root.update_idletasks()
             res = self._fit_alpha_beta_eta_from_histogram(
@@ -1640,6 +1664,7 @@ class StackDesignerApp:
         except Exception as exc:
             messagebox.showerror("Standalone Sim + Fit", str(exc))
             self.workflow_hint_var.set("Standalone simulation failed.")
+            self.sim_progress_var.set(0.0)
         finally:
             self.root.config(cursor=old_cursor)
             self.root.update_idletasks()
@@ -1705,6 +1730,8 @@ class StackDesignerApp:
         collision_count_in_resist = 0
         segments_in_resist = 0
         dr = 1.0
+        progress_t0 = time.time()
+        update_every = max(1, min(200, ne // 40))
 
         def layer_at_z(zv):
             for li, L in enumerate(layers):
@@ -1838,9 +1865,19 @@ class StackDesignerApp:
                 if (x * x + y * y) ** 0.5 > max_radius_nm * 4:
                     break
 
-            if (ie + 1) % 200 == 0 or ie == ne - 1:
+            done = ie + 1
+            if done % update_every == 0 or ie == ne - 1:
+                elapsed_s = time.time() - progress_t0
+                rate = done / elapsed_s if elapsed_s > 1e-9 else 0.0
+                eta_s = (ne - done) / rate if rate > 1e-9 else float("nan")
+                frac = done / ne if ne > 0 else 0.0
+                self.sim_progress_var.set(100.0 * frac)
                 self.workflow_hint_var.set(
-                    f"Standalone MC: simulated {ie+1}/{ne} electrons (resist collisions={collision_count_in_resist})"
+                    "Standalone MC: "
+                    f"{done}/{ne} electrons ({100.0 * frac:.1f}%), "
+                    f"collisions={collision_count_in_resist}, "
+                    f"elapsed={_format_duration_compact(elapsed_s)}, "
+                    f"ETA={_format_duration_compact(eta_s)}"
                 )
                 self.root.update_idletasks()
 
