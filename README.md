@@ -188,12 +188,5 @@ The fit pipeline currently includes:
 - generating starting values for more detailed calibration
 - teaching / demonstration of EBL scattering and PEC behavior
 
-## Publishing To GitHub
 
-If you created a remote repository already:
-
-```bash
-git remote add origin <YOUR_GITHUB_REPO_URL>
-git push -u origin main
-```
 
