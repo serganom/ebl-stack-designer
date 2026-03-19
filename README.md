@@ -2,7 +2,7 @@
 
 Desktop Python/Tkinter application for electron-beam lithography stack design, fast standalone Monte Carlo style energy-deposition simulation, and PEC parameter fitting.
 
-Author: `made by Sergei Nomoev`
+Author: `Sergei Nomoev`
 
 Suggested GitHub repo description:
 `Desktop EBL stack designer with standalone Monte Carlo PEC fitting, adaptive PSF models, and multilayer material/stack editing.`
