@@ -1925,22 +1925,24 @@ class StackDesignerApp:
         ev = evals / total_e
         ring_area = np.pi * rvals**2 - np.concatenate(([0.0], np.pi * rvals[:-1]**2))
         ed = ev / ring_area
-
-        mask = np.isfinite(ed) & (ed > 0)
-        mask[:2] = False
-        x = rvals[mask]
-        y = np.log10(ed[mask])
-        if x.size < 50:
-            raise ValueError("Too few valid points to fit alpha/beta/eta.")
-        win = (x >= 2) & (x <= min(float(rvals[-1]) * 0.6, 20000))
-        x = x[win]
-        y = y[win]
-        fit_ring_area = ring_area[mask][win]
+        fit_window = self._prepare_fit_window(
+            rvals,
+            ev,
+            ring_area,
+            ed,
+            beam_energy_keV=beam_energy_keV,
+            resist_thickness_nm=resist_thickness_nm,
+        )
+        x = fit_window["x_nm"]
+        y = fit_window["y_log10_density"]
+        fit_ring_area = fit_window["ring_area"]
+        fit_weights = fit_window["weights"]
 
         best_dg = self._fit_double_gaussian_grid(
             x,
             y,
             fit_ring_area,
+            fit_weights=fit_weights,
             beam_energy_keV=beam_energy_keV,
             resist_thickness_nm=resist_thickness_nm,
         )
@@ -1948,6 +1950,7 @@ class StackDesignerApp:
             x,
             y,
             fit_ring_area,
+            fit_weights=fit_weights,
             beam_energy_keV=beam_energy_keV,
             resist_thickness_nm=resist_thickness_nm,
             beam_sigma_nm=beam_sigma_nm,
@@ -1999,6 +2002,9 @@ class StackDesignerApp:
             "beam_energy_keV": None if beam_energy_keV is None else float(beam_energy_keV),
             "resist_thickness_nm": None if resist_thickness_nm is None else float(resist_thickness_nm),
             "resist_material_name": resist_material_name,
+            "fit_window_max_nm": fit_window["fit_window_max_nm"],
+            "fit_point_count": fit_window["fit_point_count"],
+            "fit_weighting": fit_window["weighting_description"],
         }
         if best["fit_model"] == "power_gaussian":
             out["alpha_power"] = best["alpha_power"]
@@ -2029,6 +2035,86 @@ class StackDesignerApp:
         if beta_um >= 4.0 or eta >= 0.15:
             return "Moderate boundary sensitivity: layout edges will dominate correction error."
         return "Mostly local blur regime: forward scattering dominates over long-range backscatter."
+
+    def _prepare_fit_window(
+        self,
+        rvals,
+        ev,
+        ring_area,
+        ed,
+        beam_energy_keV=None,
+        resist_thickness_nm=None,
+    ):
+        mask = np.isfinite(ed) & (ed > 0)
+        mask[:2] = False
+        x_full = np.asarray(rvals[mask], dtype=float)
+        y_full = np.log10(np.asarray(ed[mask], dtype=float))
+        ev_full = np.asarray(ev[mask], dtype=float)
+        ring_full = np.asarray(ring_area[mask], dtype=float)
+        if x_full.size < 50:
+            raise ValueError("Too few valid points to fit alpha/beta/eta.")
+
+        max_fit_radius_nm = min(float(rvals[-1]) * 0.8, 20000.0)
+        base_mask = (x_full >= 2.0) & (x_full <= max_fit_radius_nm)
+        x = x_full[base_mask]
+        y = y_full[base_mask]
+        ev_sel = ev_full[base_mask]
+        ring_sel = ring_full[base_mask]
+        if x.size < 50:
+            raise ValueError("Too few valid points in fitting window.")
+
+        tail_cut_applied = False
+        if x.size >= 80:
+            idx = np.arange(x.size, dtype=int)
+            win = min(31, max(7, (x.size // 40) * 2 + 1))
+            kernel = np.ones(win, dtype=float) / win
+            smooth_y = np.convolve(y, kernel, mode="same")
+            rough = np.abs(y - smooth_y)
+            rough_s = np.convolve(rough, kernel, mode="same")
+            rel_ev = ev_sel / max(float(np.max(ev_sel)), 1e-300)
+            cum_ev = np.cumsum(ev_sel) / max(float(np.sum(ev_sel)), 1e-300)
+            tail_start_nm = max(800.0, 2.5 * float(resist_thickness_nm or 0.0) + 250.0)
+            tail_candidates = np.where(
+                (idx >= max(60, int(0.55 * x.size)))
+                & (x >= tail_start_nm)
+                & (cum_ev >= 0.999)
+                & ((rough_s > 0.20) | (rel_ev < 5e-4))
+            )[0]
+            if tail_candidates.size:
+                cut_idx = int(tail_candidates[0])
+                if cut_idx >= 50:
+                    x_cut = x[:cut_idx]
+                    y_cut = y[:cut_idx]
+                    ev_cut = ev_sel[:cut_idx]
+                    ring_cut = ring_sel[:cut_idx]
+                    if x_cut.size >= 50:
+                        x, y, ev_sel, ring_sel = x_cut, y_cut, ev_cut, ring_cut
+                        tail_cut_applied = True
+
+        center_scale_nm = 180.0
+        if resist_thickness_nm is not None:
+            center_scale_nm = max(40.0, min(500.0, 0.8 * float(resist_thickness_nm)))
+        elif beam_energy_keV is not None:
+            center_scale_nm = max(60.0, min(350.0, 3.0 * float(beam_energy_keV)))
+        radial_w = 1.0 / (1.0 + (x / center_scale_nm) ** 0.85)
+        signal_w = np.sqrt(np.clip(ev_sel / max(float(np.max(ev_sel)), 1e-300), 1e-8, 1.0))
+        weights = radial_w * signal_w
+        weights /= max(float(np.mean(weights)), 1e-300)
+        weighting_description = (
+            "weighted log-fit with center-priority and signal-based downweighting"
+        )
+        if tail_cut_applied:
+            weighting_description += "; noisy far-tail auto-cut applied"
+
+        return {
+            "x_nm": x,
+            "y_log10_density": y,
+            "ring_area": ring_sel,
+            "weights": weights,
+            "fit_window_max_nm": float(x[-1]),
+            "fit_point_count": int(x.size),
+            "weighting_description": weighting_description,
+        }
 
     def _show_text_dialog(self, title, text, width=760, height=520):
         win = tk.Toplevel(self.root)
@@ -2067,6 +2153,9 @@ class StackDesignerApp:
             f"Eta (fit): {res['eta_fit']:.6f}\n"
             f"Eta (split): {res['eta_split']:.6f}\n"
             f"Forward split radius: {res['forward_range_nm']:.1f} nm\n"
+            f"Fit window max radius: {res.get('fit_window_max_nm', float('nan')):.1f} nm\n"
+            f"Fit points: {res.get('fit_point_count', 0)}\n"
+            f"Fit weighting: {res.get('fit_weighting', '')}\n"
             f"Fit MSE (log10 density): {res['fit_mse']:.6g}\n"
             f"PEC guidance: {res.get('pec_guidance', '')}"
         )
@@ -2097,13 +2186,25 @@ class StackDesignerApp:
             f"layer='{last.get('layer_pattern','')}'"
         )
 
-    def _fit_double_gaussian_grid(self, x_nm, y_log10_density, fit_ring_area, beam_energy_keV=None, resist_thickness_nm=None):
+    def _fit_double_gaussian_grid(
+        self,
+        x_nm,
+        y_log10_density,
+        fit_ring_area,
+        fit_weights=None,
+        beam_energy_keV=None,
+        resist_thickness_nm=None,
+    ):
         _ensure_numpy()
         x = np.asarray(x_nm, dtype=float)
         y = np.asarray(y_log10_density, dtype=float)
         ring_area = np.asarray(fit_ring_area, dtype=float)
         if len(x) != len(ring_area):
             raise ValueError("Fit window/ring area mismatch.")
+        weights = np.ones_like(x) if fit_weights is None else np.asarray(fit_weights, dtype=float)
+        if len(weights) != len(x):
+            raise ValueError("Fit weights/window mismatch.")
+        wsum = max(float(np.sum(weights)), 1e-300)
 
         beta_center_nm = _projected_backscatter_beta_nm(beam_energy_keV)
         alpha_hi = 180.0 if resist_thickness_nm is None else min(450.0, max(25.0, 0.9 * float(resist_thickness_nm)))
@@ -2124,8 +2225,9 @@ class StackDesignerApp:
                     et = etas[:, None]
                     pred_shape = (ea[None, :] + et * eb[None, :]) / (1.0 + et)
                     log_pred = np.log10(np.clip(pred_shape, 1e-300, None))
-                    offsets = np.mean(y[None, :] - log_pred, axis=1)
-                    err = np.mean((log_pred + offsets[:, None] - y[None, :]) ** 2, axis=1)
+                    offsets = np.sum(weights[None, :] * (y[None, :] - log_pred), axis=1) / wsum
+                    resid = log_pred + offsets[:, None] - y[None, :]
+                    err = np.sum(weights[None, :] * (resid ** 2), axis=1) / wsum
                     j = int(np.argmin(err))
                     mse = float(err[j])
                     if best_local is None or mse < best_local["mse"]:
@@ -2160,6 +2262,7 @@ class StackDesignerApp:
         x_nm,
         y_log10_density,
         fit_ring_area,
+        fit_weights=None,
         beam_energy_keV=None,
         resist_thickness_nm=None,
         beam_sigma_nm=None,
@@ -2171,6 +2274,10 @@ class StackDesignerApp:
         ring_area = np.asarray(fit_ring_area, dtype=float)
         if len(x) != len(ring_area):
             raise ValueError("Fit window/ring area mismatch.")
+        weights = np.ones_like(x) if fit_weights is None else np.asarray(fit_weights, dtype=float)
+        if len(weights) != len(x):
+            raise ValueError("Fit weights/window mismatch.")
+        wsum = max(float(np.sum(weights)), 1e-300)
 
         x2 = x * x
         beam_floor_nm = max(1.0, 0.5 * float(beam_sigma_nm or 0.0))
@@ -2191,8 +2298,9 @@ class StackDesignerApp:
                     et = etas[:, None]
                     pred_shape = (pow_comp[None, :] + et * gauss_comp[None, :]) / (1.0 + et)
                     log_pred = np.log10(np.clip(pred_shape, 1e-300, None))
-                    offsets = np.mean(y[None, :] - log_pred, axis=1)
-                    err = np.mean((log_pred + offsets[:, None] - y[None, :]) ** 2, axis=1)
+                    offsets = np.sum(weights[None, :] * (y[None, :] - log_pred), axis=1) / wsum
+                    resid = log_pred + offsets[:, None] - y[None, :]
+                    err = np.sum(weights[None, :] * (resid ** 2), axis=1) / wsum
                     j = int(np.argmin(err))
                     mse = float(err[j])
                     if best_local is None or mse < best_local["mse"]:
@@ -2261,11 +2369,12 @@ class StackDesignerApp:
             )
 
         mpl = _ensure_matplotlib_pyplot()
+        fit_label = f"{self._fit_model_display_name(res)} fit"
         if mpl is not None:
             fig = mpl.figure(figsize=(7, 5))
             ax = fig.add_subplot(111)
             ax.loglog(r, y_meas, '.', markersize=3, label='Measured (simulation histogram)')
-            ax.loglog(r, y_fit, '-', linewidth=1.5, label='Double-Gaussian fit')
+            ax.loglog(r, y_fit, '-', linewidth=1.5, label=fit_label)
             ax.set_xlabel('Radius (nm)')
             ax.set_ylabel('Deposited energy density (normalized, 1/nm^2)')
             ax.set_title(title)
@@ -2360,7 +2469,7 @@ class StackDesignerApp:
             canvas.create_oval(lx + 8, ly + 9, lx + 12, ly + 13, fill="#1f77b4", outline="")
             canvas.create_text(lx + 20, ly + 11, text="Measured (histogram)", anchor="w", font=("Helvetica", 9))
             canvas.create_line(lx + 8, ly + 28, lx + 18, ly + 28, fill="#d62728", width=2)
-            canvas.create_text(lx + 20, ly + 28, text="Double-Gaussian fit", anchor="w", font=("Helvetica", 9))
+            canvas.create_text(lx + 20, ly + 28, text=fit_label, anchor="w", font=("Helvetica", 9))
 
             canvas.create_text(left + pw / 2, h - 15, text="Radius (nm) [log scale]", font=("Helvetica", 10))
             canvas.create_text(15, top + ph / 2, text="Density\n(log)", font=("Helvetica", 10))
