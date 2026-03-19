@@ -1,102 +1,147 @@
 # EBL Stack Designer
 
-`EBL Stack Designer` is a desktop Python/Tkinter application for electron-beam lithography stack design and fast proximity-effect estimation.
+Desktop Python/Tkinter application for electron-beam lithography stack design, fast standalone Monte Carlo style energy-deposition simulation, and PEC parameter fitting.
 
 Author: `made by Sergei Nomoev`
 
-## What The Program Does
+Suggested GitHub repo description:
+`Desktop EBL stack designer with standalone Monte Carlo PEC fitting, adaptive PSF models, and multilayer material/stack editing.`
 
-- builds multilayer EBL stacks from user-defined materials
-- stores elemental composition, density, thickness, and layer role
-- previews the stack cross-section
-- runs a built-in Monte Carlo style transport model for the selected resist layer
-- fits PEC parameters from the deposited-energy histogram
-- supports both a standard double-Gaussian PSF and an adaptive power-Gaussian composite PSF
-- saves projects and exports text summaries
+## What It Is
+
+`EBL Stack Designer` is a practical GUI tool for building multilayer EBL stacks and estimating proximity-effect parameters without requiring a full external Monte Carlo workflow for every iteration.
+
+It is meant for:
+
+- rapid PEC exploration
+- comparing substrates, resists, and layer stacks
+- estimating `alpha`, `beta`, `eta`, or `alpha_p`
+- educational and engineering use
+
+It is not meant to replace a fully calibrated production simulator.
+
+## Current Highlights
+
+- custom material library with elemental composition, density, weight fraction, and atomic fraction
+- multilayer stack editor with roles such as `resist`, `substrate`, `metal`, `dielectric`, and `adhesion`
+- stack cross-section preview
+- resizable dialogs and scrollable forms/lists
+- standalone transport simulation for the selected resist layer
+- adaptive PSF fitting:
+  - double-Gaussian
+  - power-Gaussian composite
+- weighted fitting with center-priority
+- automatic noisy-tail cutoff during fit preparation
+- fit plot viewer
+- live Monte Carlo progress window with:
+  - electron count
+  - percent complete
+  - elapsed time
+  - ETA
+  - approximate electron rate
+- JSON save/load
+- exportable project summary
 
 ## Physics Summary
 
-This version is not just a UI shell. It includes a standalone physical approximation for EBL transport and PEC fitting:
+The program contains a lightweight standalone physical approximation for EBL transport and PEC fitting.
 
-- compound material properties are derived from elemental fractions, density, effective atomic number, effective atomic weight, and mean ionization energy
-- continuous energy loss uses a Joy-Luo / modified Bethe style stopping model with Bragg additivity for compounds
-- elastic deflection uses a screened Rutherford-inspired angular model
-- transport length scales are tied to a Kanaya-Okayama / Kyser-Murata style `E^1.67` range scaling
-- deposited energy is accumulated radially inside the chosen resist layer
-- the radial energy-density profile is fit either with:
-  - a double-Gaussian PSF for standard PEC workflows
-  - a power-Gaussian composite PSF for high-voltage and thin-resist regimes
+Implemented ideas include:
 
-Short version: the tool is meant to be a fast engineering estimator for PEC exploration, not a replacement for full CASINO, GEANT4, or a rigorously calibrated production simulator.
+- compound material properties derived from elemental fractions
+- effective atomic number and atomic weight
+- Bragg-type compound stopping bookkeeping
+- Joy-Luo / modified Bethe inspired continuous slowing-down
+- screened Rutherford-inspired elastic scattering
+- Kanaya-Okayama / Kyser-Murata style `E^1.67` range scaling
+- radial deposited-energy histogram inside the selected resist layer
+- adaptive PSF model selection based on fit quality and exposure regime
+
+Short version:
+
+- transport is approximate but physically motivated
+- fitting is intended to give useful engineering PEC parameters
+- the code is fast enough for interactive iteration inside a GUI
 
 More detail is in [docs/PHYSICS.md](docs/PHYSICS.md).
 
-## References Used For The Current Physics Direction
+## References Behind The Current Direction
 
 - Qingyuan Mao, Jingyuan Zhu, Xinbin Cheng, Zhanshan Wang, "Proximity effect correction in electron beam lithography using a composite function model of electron scattering energy distribution", Discover Nano (2025). DOI: [10.1186/s11671-025-04264-0](https://doi.org/10.1186/s11671-025-04264-0)
 - "Fast and accurate proximity effect correction algorithm based on pattern edge shape adjustment for electron beam lithography", Microelectronics Journal (2023). DOI: [10.1016/j.mejo.2023.105718](https://doi.org/10.1016/j.mejo.2023.105718)
 - Takashi Kamikubo et al., JJAP (1997). DOI: [10.1143/JJAP.36.7546](https://doi.org/10.1143/JJAP.36.7546)
-- Joy and Luo, Scanning (1989), modified Bethe stopping formulation
-- Kyser and Murata, IBM Journal of Research and Development (1974), electron-scattering transport scaling
-- Chang, Journal of Vacuum Science and Technology (1975), double-Gaussian PEC model
+- Joy and Luo, Scanning (1989)
+- Kyser and Murata, IBM Journal of Research and Development (1974)
+- Chang, Journal of Vacuum Science and Technology (1975)
 
 ## Repository Layout
 
-- `ebl_stack_designer.py` — main GUI application
-- `run_ebl_stack_designer.sh` — simple launcher
-- `requirements.txt` — Python dependencies
-- `docs/PHYSICS.md` — short physics note and formulas
+- `ebl_stack_designer.py` — main application
+- `run_ebl_stack_designer.sh` — shell launcher
+- `run_ebl_stack_designer.command` — macOS double-click launcher
+- `requirements.txt` — runtime Python dependencies
+- `docs/PHYSICS.md` — short physics note
 
 ## Installation
 
-### 1. Create a virtual environment
+### Create a virtual environment
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-### 2. Install dependencies
+### Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Notes:
+Dependencies:
 
-- `tkinter` usually comes with the Python installation. On Linux it may need to be installed from the system package manager.
-- `matplotlib` is optional for the main app logic, but recommended for plotting PEC fits.
+- `numpy`
+- `matplotlib`
+- `tkinter` from the Python installation
+
+On Linux, `tkinter` may need a system package such as `python3-tk`.
 
 ## Run
 
-Using the launcher:
+### Standard shell launcher
 
 ```bash
 ./run_ebl_stack_designer.sh
 ```
 
-Or on macOS by double-clicking:
+### macOS double-click launcher
 
 ```bash
 run_ebl_stack_designer.command
 ```
 
-Or directly:
+### Direct Python launch
 
 ```bash
 python3 ebl_stack_designer.py
 ```
 
-macOS note:
+### Important macOS note
 
-- on some macOS installations, `/usr/bin/python3` is not suitable for this GUI app
-- if that happens, use the python.org Framework build instead, for example:
+On some macOS systems, `/usr/bin/python3` is not suitable for this GUI app.
+
+If needed, use the python.org Framework build explicitly:
 
 ```bash
 /Library/Frameworks/Python.framework/Versions/3.12/bin/python3 ebl_stack_designer.py
 ```
 
-- the bundled launcher script now prefers a Python interpreter with working `tkinter`
+If dependencies are missing for that interpreter:
+
+```bash
+/Library/Frameworks/Python.framework/Versions/3.12/bin/python3 -m pip install numpy matplotlib
+```
+
+The bundled launchers try to prefer a Python interpreter with working `tkinter`.
 
 ## Basic Workflow
 
@@ -105,31 +150,50 @@ macOS note:
 3. Mark the resist layer with role `resist`.
 4. Set beam energy and optional beam diameter/current.
 5. Run `Simulation + Fit`.
-6. Inspect the fitted PEC parameters and export the project summary if needed.
+6. Watch the dedicated progress window during Monte Carlo.
+7. Inspect the fit result and plot.
+8. Save the project or export a summary.
 
-## Current Output
+## What The Fit Produces
 
-The app can estimate and display:
+Depending on the chosen model, the program can estimate:
 
-- forward blur parameter `alpha` for double-Gaussian fits
-- forward power exponent `alpha_p` for power-Gaussian fits
-- backscatter range `beta`
-- fitted energy ratio `eta`
+- `alpha` for double-Gaussian forward blur
+- `alpha_p` for power-Gaussian forward behavior
+- `beta` for long-range backscatter spread
+- `eta` fit ratio
 - split-based forward/back energy ratio estimate
-- a simple PEC guidance label based on long-range backscatter strength
+- simple PEC guidance text based on long-range blur strength
 
-## Important Limitations
+The fit pipeline currently includes:
 
-- this is a fast approximate standalone model
+- weighted log-space fitting
+- center-priority weighting
+- signal-based downweighting
+- optional far-tail automatic cutoff when the histogram becomes noise-dominated
+
+## Current Limitations
+
+- this is still a fast approximate standalone model
 - it is not numerically identical to CASINO
-- material presets for commercial resists are approximate because exact formulations are proprietary
-- PEC accuracy still depends on calibration against real process data
+- commercial resist presets are approximate because exact chemistries are proprietary
+- PEC parameters should still be calibrated against experiment for real process use
+- a two-component PSF can still be too simple for some exposure regimes
 
-## Upload To GitHub
+## Good Use Cases
 
-This folder is prepared to be a clean GitHub repository. After creating a GitHub repo, use:
+- fast substrate comparison
+- resist / thickness trend exploration
+- early PEC parameter estimation
+- generating starting values for more detailed calibration
+- teaching / demonstration of EBL scattering and PEC behavior
+
+## Publishing To GitHub
+
+If you created a remote repository already:
 
 ```bash
 git remote add origin <YOUR_GITHUB_REPO_URL>
 git push -u origin main
 ```
+

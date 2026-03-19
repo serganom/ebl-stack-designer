@@ -96,7 +96,20 @@ Both candidate models are fit on the same histogram window.
 
 The program prefers the power-Gaussian model in high-voltage / thin-resist regimes, but still compares the fit error and can fall back to the double-Gaussian model if it is clearly better.
 
-## 8. Scope
+## 8. Fit Weighting And Tail Handling
+
+The fit is not an unweighted raw least-squares pass over the whole histogram.
+
+The current implementation gives higher importance to:
+
+- smaller radii
+- stronger-signal bins
+
+This is intentional, because the physically important forward-scattering region near the beam center should not be dominated by a large number of weak far-tail bins.
+
+The code can also cut the far tail automatically when the histogram becomes noise-dominated. This avoids dragging the whole fit toward sparse long-range Monte Carlo noise.
+
+## 9. Scope
 
 This is an engineering approximation for rapid PEC exploration inside a GUI workflow.
 
@@ -111,4 +124,3 @@ It should not be treated as:
 - a replacement for calibrated full Monte Carlo engines
 - a substitute for measured process calibration
 - a process-certified production model
-
