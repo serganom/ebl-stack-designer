@@ -58,7 +58,11 @@ This term is blended with a simple CSDA-like range-derived term to avoid unphysi
 
 Deposited energy is accumulated inside the selected resist layer as a radial histogram.
 
+If multiple adjacent layers are marked as `resist`, they can be analyzed as one combined resist region. This is useful for PMMA bilayer processes such as PMMA 950k on PMMA 495k, where the chemistry is similar but the process stack still benefits from keeping the layers explicit in the editor.
+
 Instead of dumping the whole segment energy at a single endpoint, the code subdivides the lateral segment and distributes energy along it. This reduces center-bias artifacts in the histogram.
+
+For the final layer, clearly bulk substrates are treated as semi-infinite for transport. Thin substrate or membrane-like examples, such as a 4.4 um Si layer, remain finite so that the simulated stack matches the entered geometry.
 
 ## 6. PEC / PSF Fitting
 

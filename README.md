@@ -24,6 +24,8 @@ It is not meant to replace a fully calibrated production simulator.
 
 - custom material library with elemental composition, density, weight fraction, and atomic fraction
 - multilayer stack editor with roles such as `resist`, `substrate`, `metal`, `dielectric`, and `adhesion`
+- preset example stack for PMMA bilayer / graphene / Al2O3 / Au / SiO2 / thin Si
+- combined PEC analysis for multiple layers marked as `resist`
 - stack cross-section preview
 - resizable dialogs and scrollable forms/lists
 - standalone transport simulation for the selected resist layer
@@ -154,6 +156,22 @@ The bundled launchers try to prefer a Python interpreter with working `tkinter`.
 7. Inspect the fit result and plot.
 8. Save the project or export a summary.
 
+For the included Sergei example stack, use `Add Preset Stack` and choose:
+
+`PMMA bilayer / graphene / Al2O3 / Au / SiO2 / thin Si (Sergei example)`
+
+The preset represents:
+
+- PMMA 950k, 90 nm
+- PMMA 495k, 150 nm
+- graphene / carbon, 1 nm
+- ALD-like Al2O3, 100 nm
+- Au, 70 nm
+- SiO2, 300 nm
+- Si, 4.4 um
+
+Both PMMA layers are marked as `resist`; during simulation the app can fit them as one combined resist region.
+
 ## What The Fit Produces
 
 Depending on the chosen model, the program can estimate:
@@ -196,4 +214,3 @@ If you created a remote repository already:
 git remote add origin <YOUR_GITHUB_REPO_URL>
 git push -u origin main
 ```
-

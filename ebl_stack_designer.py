@@ -93,6 +93,12 @@ def preset_material_library():
         "Generic PMMA 495k approximation (same chemistry class; molecular weight differs)."
     ))
     mats.append(_mat(
+        "PMMA 450k (generic)", "PMMA 450k",
+        1.19,
+        [("C", 6, 0.600, 0.333), ("H", 1, 0.080, 0.533), ("O", 8, 0.320, 0.134)],
+        "Generic PMMA 450k approximation (same chemistry class; molecular weight differs)."
+    ))
+    mats.append(_mat(
         "MMA/MAA copolymer (generic)", "MMA/MAA; PMMA copolymer; MMA",
         1.05,
         [("C", 6, 0.575, 0.330), ("H", 1, 0.082, 0.540), ("O", 8, 0.343, 0.130)],
@@ -176,6 +182,18 @@ def preset_material_library():
         3.98,
         [("Al", 13, 0.5293, 2/5), ("O", 8, 0.4707, 3/5)],
         "Sapphire modeled as crystalline Al2O3."
+    ))
+    mats.append(_mat(
+        "Aluminum Oxide (Al2O3, ALD approx.)", "Al2O3; alumina; aluminum oxide; ALD Al2O3",
+        3.00,
+        [("Al", 13, 0.5293, 2/5), ("O", 8, 0.4707, 3/5)],
+        "Amorphous/ALD Al2O3 thin-film approximation."
+    ))
+    mats.append(_mat(
+        "Graphene / Carbon (C)", "Graphene; C; carbon; graphite",
+        2.26,
+        [("C", 6, 1.0, 1.0)],
+        "Graphene or ultrathin carbon layer approximation."
     ))
     mats.append(_mat(
         "Chromium (Cr)", "Cr",
@@ -262,6 +280,28 @@ def preset_stack_templates():
                 {"material_name": "Chromium (Cr)", "thickness_nm": 3.0, "role": "adhesion"},
                 {"material_name": "Silicon Dioxide (SiO2)", "thickness_nm": 300.0, "role": "dielectric"},
                 {"material_name": "Silicon (Si)", "thickness_nm": 350000.0, "role": "substrate"},
+            ],
+        },
+        {
+            "name": "PMMA bilayer / graphene / Al2O3 / Au / SiO2 / thin Si (Sergei example)",
+            "description": "50 keV PEC example: PMMA 950k 90 nm / PMMA 495k 150 nm / C 1 nm / Al2O3 100 nm / Au 70 nm / SiO2 300 nm / Si 4.4 um.",
+            "materials": [
+                "PMMA 950k (generic)",
+                "PMMA 495k (generic)",
+                "Graphene / Carbon (C)",
+                "Aluminum Oxide (Al2O3, ALD approx.)",
+                "Gold (Au)",
+                "Silicon Dioxide (SiO2)",
+                "Silicon (Si)",
+            ],
+            "stack": [
+                {"material_name": "PMMA 950k (generic)", "thickness_nm": 90.0, "role": "resist"},
+                {"material_name": "PMMA 495k (generic)", "thickness_nm": 150.0, "role": "resist"},
+                {"material_name": "Graphene / Carbon (C)", "thickness_nm": 1.0, "role": "underlayer"},
+                {"material_name": "Aluminum Oxide (Al2O3, ALD approx.)", "thickness_nm": 100.0, "role": "dielectric"},
+                {"material_name": "Gold (Au)", "thickness_nm": 70.0, "role": "metal"},
+                {"material_name": "Silicon Dioxide (SiO2)", "thickness_nm": 300.0, "role": "dielectric"},
+                {"material_name": "Silicon (Si)", "thickness_nm": 4400.0, "role": "substrate"},
             ],
         },
     ]
@@ -1512,9 +1552,10 @@ class StackDesignerApp:
             messagebox.showerror("Standalone Sim + Fit", str(exc))
             return
 
-        resist_idx = self._choose_resist_layer_index()
-        if resist_idx is None:
+        resist_selection = self._choose_resist_layer_index()
+        if resist_selection is None:
             return
+        resist_indices = list(resist_selection) if isinstance(resist_selection, (list, tuple)) else [int(resist_selection)]
 
         defaults = {
             "electrons": "3000",
@@ -1531,8 +1572,18 @@ class StackDesignerApp:
         _, frm, _ = _create_scrolled_body(dlg, padding=10)
         frm.columnconfigure(1, weight=1)
 
-        layer = self.project["stack"][resist_idx]
-        ttk.Label(frm, text=f"Resist layer: #{resist_idx+1} {layer.get('material_name')}").grid(
+        if len(resist_indices) == 1:
+            layer = self.project["stack"][resist_indices[0]]
+            resist_label = f"Resist layer: #{resist_indices[0]+1} {layer.get('material_name')}"
+        else:
+            parts = []
+            total_t = 0.0
+            for idx in resist_indices:
+                layer = self.project["stack"][idx]
+                total_t += float(layer.get("thickness_nm", 0.0) or 0.0)
+                parts.append(f"#{idx+1} {layer.get('material_name')}")
+            resist_label = f"Combined resist layers: {' + '.join(parts)} | total {total_t:.3f} nm"
+        ttk.Label(frm, text=resist_label).grid(
             row=0, column=0, columnspan=2, sticky="w", padx=4, pady=(0, 8)
         )
 
@@ -1561,7 +1612,8 @@ class StackDesignerApp:
         def on_run():
             try:
                 params = {
-                    "resist_layer_index": resist_idx,
+                    "resist_layer_index": resist_indices[0],
+                    "resist_layer_indices": resist_indices,
                     "electrons": int(float(vars_["electrons"].get())),
                     "max_radius_nm": int(float(vars_["max_radius_nm"].get())),
                     "forward_nm": float(vars_["forward_nm"].get()),
@@ -1605,18 +1657,26 @@ class StackDesignerApp:
             )
             return idx
 
+        total_t = sum(float(stack[i].get("thickness_nm", 0.0) or 0.0) for i in candidates)
         names = [
+            "Combined all resist layers: "
+            + " + ".join(f"#{i+1} {stack[i].get('material_name','?')}" for i in candidates)
+            + f" ({total_t:.3f} nm total)"
+        ]
+        names.extend(
             f"#{i+1}: {stack[i].get('material_name','?')} ({stack[i].get('thickness_nm','?')} nm)"
             for i in candidates
-        ]
+        )
         local_idx = self._single_select_dialog(
             title="Select Resist Layer",
-            prompt="Multiple layers are marked as 'resist'. Choose one for PEC analysis.",
+            prompt="Multiple layers are marked as 'resist'. Choose combined bilayer analysis or one layer.",
             items=names,
         )
         if local_idx is None:
             return None
-        return candidates[local_idx]
+        if local_idx == 0:
+            return candidates
+        return candidates[local_idx - 1]
 
     def _run_standalone_mc_job(self, params):
         old_cursor = self.root.cget("cursor")
@@ -1659,6 +1719,7 @@ class StackDesignerApp:
                 "min_energy_keV": params["min_energy_keV"],
                 "beam_energy_keV": self.project.get("beam", {}).get("energy_keV"),
                 "resist_layer_index": params["resist_layer_index"],
+                "resist_layer_indices": params.get("resist_layer_indices", [params["resist_layer_index"]]),
                 "collision_count_in_resist": sim["collision_count_in_resist"],
                 "segments_in_resist": sim["segments_in_resist"],
             }
@@ -1711,14 +1772,28 @@ class StackDesignerApp:
         if total_stack_nm <= 0:
             raise ValueError("Total stack thickness must be > 0.")
 
-        resist_idx = int(params["resist_layer_index"])
-        if resist_idx < 0 or resist_idx >= len(layers):
-            raise ValueError("Invalid resist layer index.")
-        resist_layer = layers[resist_idx]
-        launch_props = resist_layer["props"]
+        resist_indices_raw = params.get("resist_layer_indices")
+        if resist_indices_raw is None:
+            resist_indices = [int(params["resist_layer_index"])]
+        else:
+            resist_indices = [int(i) for i in resist_indices_raw]
+        if not resist_indices:
+            raise ValueError("No resist layer selected.")
+        for resist_idx in resist_indices:
+            if resist_idx < 0 or resist_idx >= len(layers):
+                raise ValueError("Invalid resist layer index.")
+        resist_layers = [layers[i] for i in resist_indices]
+        launch_props = resist_layers[0]["props"]
+        resist_intervals = [(L["z0"], L["z1"]) for L in resist_layers]
+        resist_thickness_nm = sum(float(L["thickness_nm"]) for L in resist_layers)
+        resist_layer_name = " + ".join(L["name"] for L in resist_layers)
 
-        # Treat last substrate as semi-infinite for transport if labeled substrate.
-        if layers and str(layers[-1].get("role", "")).lower() == "substrate":
+        # Keep thin membrane-style substrates finite, but treat clearly bulk substrates as semi-infinite.
+        if (
+            layers
+            and str(layers[-1].get("role", "")).lower() == "substrate"
+            and float(layers[-1].get("thickness_nm", 0.0) or 0.0) >= 50000.0
+        ):
             layers[-1]["z1"] = float("inf")
 
         max_radius_nm = max(int(params["max_radius_nm"]), 1000)
@@ -1752,7 +1827,7 @@ class StackDesignerApp:
 
         def deposit_in_resist(x0, y0, x1, y1, zmid, dE, collision_flag=False):
             nonlocal collision_count_in_resist, segments_in_resist
-            if zmid < resist_layer["z0"] or zmid >= resist_layer["z1"]:
+            if not any(zmid >= z0 and zmid < z1 for z0, z1 in resist_intervals):
                 return
             if dE > 0:
                 lateral_len = math.hypot(x1 - x0, y1 - y0)
@@ -1900,11 +1975,12 @@ class StackDesignerApp:
         return {
             "rvals_nm": rvals,
             "evals": evals,
-            "resist_layer_index": resist_idx,
-            "resist_layer_name": resist_layer["name"],
+            "resist_layer_index": resist_indices[0],
+            "resist_layer_indices": resist_indices,
+            "resist_layer_name": resist_layer_name,
             "collision_count_in_resist": int(collision_count_in_resist),
             "segments_in_resist": int(segments_in_resist),
-            "resist_thickness_nm": float(resist_layer["thickness_nm"]),
+            "resist_thickness_nm": float(resist_thickness_nm),
             "beam_sigma_nm": float(beam_sigma_nm),
         }
 
