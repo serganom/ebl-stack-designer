@@ -2493,25 +2493,30 @@ class StackDesignerApp:
         seed_beta = max(seed_alpha * 3.0, seed_beta)
 
         # Downsample for a fast BEAMER-oriented fit while keeping log-spaced radius coverage.
-        if x.size > 850:
-            idx = np.unique(np.round(np.geomspace(1, x.size - 1, 850)).astype(int))
+        if x.size > 650:
+            idx = np.unique(np.round(np.geomspace(1, x.size - 1, 650)).astype(int))
             x = x[idx]
             y = y[idx]
             ring_area = ring_area[idx]
             weights = weights[idx]
 
-        density = 10.0 ** y
         x2 = x * x
-        sqrt_w = np.sqrt(np.clip(weights, 1e-12, None))
-        weighted_target = sqrt_w * density
+        weights = np.clip(weights, 1e-12, None)
+        wsum = max(float(np.sum(weights)), 1e-300)
 
         def normalized_gaussian(width_nm):
             comp = np.exp(-x2 / max(float(width_nm) ** 2, 1e-24))
             comp /= max(float(np.sum(comp * ring_area)), 1e-300)
             return comp
 
-        def score_grid(alpha_grid, gamma_grid, beta_grid):
+        def score_grid(alpha_grid, gamma_grid, beta_grid, eta_grid, nue_grid):
             best_local = None
+            eta_vals = np.asarray(list(eta_grid), dtype=float)
+            nue_vals = np.asarray(list(nue_grid), dtype=float)
+            eta_mesh, nue_mesh = np.meshgrid(eta_vals, nue_vals, indexing="ij")
+            eta_flat = eta_mesh.reshape(-1, 1)
+            nue_flat = nue_mesh.reshape(-1, 1)
+            denom = 1.0 + eta_flat + nue_flat
             for alpha_nm in alpha_grid:
                 alpha_nm = float(alpha_nm)
                 alpha_comp = normalized_gaussian(alpha_nm)
@@ -2525,26 +2530,24 @@ class StackDesignerApp:
                         if beta_nm <= gamma_nm * 1.15:
                             continue
                         beta_comp = normalized_gaussian(beta_nm)
-                        model = np.vstack((alpha_comp, beta_comp, gamma_comp)).T
-                        weighted_model = model * sqrt_w[:, None]
-                        try:
-                            coeffs = np.linalg.lstsq(weighted_model, weighted_target, rcond=None)[0]
-                        except Exception:
-                            continue
-                        if not np.all(np.isfinite(coeffs)):
-                            continue
-                        if coeffs[0] <= 0.0 or coeffs[1] <= 0.0 or coeffs[2] <= 0.0:
-                            continue
-                        pred = model @ coeffs
+                        pred = (
+                            alpha_comp[None, :]
+                            + eta_flat * beta_comp[None, :]
+                            + nue_flat * gamma_comp[None, :]
+                        ) / denom
                         log_pred = np.log10(np.clip(pred, 1e-300, None))
-                        err = float(np.sum(weights * (log_pred - y) ** 2) / max(float(np.sum(weights)), 1e-300))
+                        offsets = np.sum(weights[None, :] * (y[None, :] - log_pred), axis=1) / wsum
+                        resid = log_pred + offsets[:, None] - y[None, :]
+                        errs = np.sum(weights[None, :] * (resid ** 2), axis=1) / wsum
+                        j = int(np.argmin(errs))
+                        err = float(errs[j])
                         if best_local is None or err < best_local["mse"]:
                             best_local = {
                                 "alpha_nm": alpha_nm,
                                 "beta_nm": beta_nm,
-                                "eta_fit": float(coeffs[1] / coeffs[0]),
+                                "eta_fit": float(eta_flat[j, 0]),
                                 "gamma1_nm": gamma_nm,
-                                "nue1": float(coeffs[2] / coeffs[0]),
+                                "nue1": float(nue_flat[j, 0]),
                                 "gamma2_nm": 0.0,
                                 "nue2": 0.0,
                                 "mse": err,
@@ -2554,26 +2557,30 @@ class StackDesignerApp:
         gamma_lo = max(seed_alpha * 1.4, 15.0)
         gamma_hi = max(gamma_lo * 1.4, min(seed_beta / 1.25, max(120.0, seed_beta * 0.65)))
         coarse = score_grid(
-            np.geomspace(max(1.0, seed_alpha / 2.5), seed_alpha * 2.5, 13),
-            np.geomspace(gamma_lo, gamma_hi, 24),
-            np.geomspace(max(gamma_lo * 1.3, seed_beta / 2.4), min(140000.0, seed_beta * 2.4), 18),
+            np.geomspace(max(1.0, seed_alpha / 2.8), seed_alpha * 2.4, 9),
+            np.geomspace(gamma_lo, gamma_hi, 16),
+            np.geomspace(max(gamma_lo * 1.3, seed_beta / 2.6), min(140000.0, seed_beta * 2.6), 11),
+            np.geomspace(max(0.003, seed_eta / 8.0), max(8.0, seed_eta * 4.0), 16),
+            np.geomspace(0.003, 3.0, 14),
         )
         if coarse is None:
             return {
                 "alpha_nm": seed_alpha,
                 "beta_nm": seed_beta,
                 "eta_fit": seed_eta,
-                "gamma1_nm": 0.0,
-                "nue1": 0.0,
+                "gamma1_nm": max(seed_alpha * 4.0, 40.0),
+                "nue1": 0.01,
                 "gamma2_nm": 0.0,
                 "nue2": 0.0,
                 "mse": float(seed.get("mse", float("nan"))),
             }
 
         refined = score_grid(
-            np.geomspace(max(1.0, coarse["alpha_nm"] / 1.8), coarse["alpha_nm"] * 1.8, 15),
-            np.geomspace(max(coarse["alpha_nm"] * 1.2, coarse["gamma1_nm"] / 2.0), coarse["gamma1_nm"] * 2.0, 24),
-            np.geomspace(max(coarse["gamma1_nm"] * 1.2, coarse["beta_nm"] / 1.9), min(140000.0, coarse["beta_nm"] * 1.9), 20),
+            np.geomspace(max(1.0, coarse["alpha_nm"] / 1.8), coarse["alpha_nm"] * 1.8, 11),
+            np.geomspace(max(coarse["alpha_nm"] * 1.2, coarse["gamma1_nm"] / 2.0), coarse["gamma1_nm"] * 2.0, 18),
+            np.geomspace(max(coarse["gamma1_nm"] * 1.2, coarse["beta_nm"] / 1.9), min(140000.0, coarse["beta_nm"] * 1.9), 13),
+            np.geomspace(max(1e-4, coarse["eta_fit"] / 4.0), coarse["eta_fit"] * 4.0, 16),
+            np.geomspace(max(1e-4, coarse["nue1"] / 4.0), coarse["nue1"] * 4.0, 14),
         )
         return refined or coarse
 
