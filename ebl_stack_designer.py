@@ -2376,6 +2376,26 @@ class StackDesignerApp:
             "They are shown even when the selected physical fit is Power-Gaussian."
         )
 
+    def _beamer_plot_annotation(self, res):
+        beamer = res.get("beamer_gaussian") or (res.get("fit_candidates") or {}).get("beamer_gaussian")
+        dg = (res.get("fit_candidates") or {}).get("double_gaussian")
+        src = beamer or dg
+        if not src:
+            return ""
+        try:
+            fwhm_um = float(res.get("beamer_fwhm_um", 0.03))
+        except Exception:
+            fwhm_um = 0.03
+        return (
+            "BEAMER values (um)\n"
+            f"Alpha={float(src.get('alpha_nm', float('nan'))) / 1000.0:.6f}\n"
+            f"Beta={float(src.get('beta_nm', float('nan'))) / 1000.0:.6f}\n"
+            f"Eta={float(src.get('eta_fit', float('nan'))):.6f}\n"
+            f"Gamma1={float(src.get('gamma1_nm', 0.0) or 0.0) / 1000.0:.6f}\n"
+            f"Nue1={float(src.get('nue1', 0.0) or 0.0):.6f}\n"
+            f"FWHM={fwhm_um:.6f}"
+        )
+
     def _store_fit_result(self, res):
         fit_record = dict(res)
         fit_record["beam"] = dict(self.project.get("beam", {}))
@@ -2700,8 +2720,9 @@ class StackDesignerApp:
 
         mpl = _ensure_matplotlib_pyplot()
         fit_label = f"{self._fit_model_display_name(res)} fit"
+        beamer_annotation = self._beamer_plot_annotation(res)
         if mpl is not None:
-            fig = mpl.figure(figsize=(7, 5))
+            fig = mpl.figure(figsize=(8.5, 5.6))
             ax = fig.add_subplot(111)
             ax.loglog(r, y_meas, '.', markersize=3, label='Measured (simulation histogram)')
             ax.loglog(r, y_fit, '-', linewidth=1.5, label=fit_label)
@@ -2710,13 +2731,30 @@ class StackDesignerApp:
             ax.set_title(title)
             ax.grid(True, which='both', alpha=0.25)
             ax.legend()
+            if beamer_annotation:
+                ax.text(
+                    0.985,
+                    0.04,
+                    beamer_annotation,
+                    transform=ax.transAxes,
+                    ha="right",
+                    va="bottom",
+                    fontsize=8.5,
+                    family="monospace",
+                    bbox={
+                        "boxstyle": "round,pad=0.35",
+                        "facecolor": "white",
+                        "edgecolor": "#666666",
+                        "alpha": 0.88,
+                    },
+                )
             fig.tight_layout()
             mpl.show()
             return
 
-        self._plot_last_fit_tk(r, y_meas, y_fit, title)
+        self._plot_last_fit_tk(r, y_meas, y_fit, title, beamer_annotation)
 
-    def _plot_last_fit_tk(self, r, y_meas, y_fit, title):
+    def _plot_last_fit_tk(self, r, y_meas, y_fit, title, beamer_annotation=""):
         win = tk.Toplevel(self.root)
         win.title("PEC Fit Plot (Tk fallback)")
         _configure_toplevel(win, self.root, width=900, height=650, min_width=520, min_height=360)
@@ -2728,7 +2766,10 @@ class StackDesignerApp:
         canvas = tk.Canvas(outer, bg="white", highlightthickness=1, highlightbackground="#999")
         canvas.pack(fill="both", expand=True)
 
-        info = ttk.Label(outer, text="Matplotlib not found, using built-in plot. Axes are log-log.")
+        info_text = "Matplotlib not found, using built-in plot. Axes are log-log."
+        if beamer_annotation:
+            info_text += "\n\n" + beamer_annotation
+        info = ttk.Label(outer, text=info_text, justify="left")
         info.pack(anchor="w", pady=(6, 0))
 
         def draw(_event=None):
