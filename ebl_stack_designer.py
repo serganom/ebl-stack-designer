@@ -2042,6 +2042,13 @@ class StackDesignerApp:
             beam_sigma_nm=beam_sigma_nm,
             resist_material_name=resist_material_name,
         )
+        beamer_fit = self._fit_beamer_gaussian_grid(
+            x,
+            y,
+            fit_ring_area,
+            fit_weights=fit_weights,
+            double_gaussian_seed=best_dg,
+        )
 
         prefer_pg = _is_high_tension_thin_resist(beam_energy_keV, resist_thickness_nm)
         if prefer_pg:
@@ -2084,7 +2091,9 @@ class StackDesignerApp:
                     "beta_nm": best_pg["beta_nm"],
                     "eta_fit": best_pg["eta_fit"],
                 },
+                "beamer_gaussian": dict(beamer_fit),
             },
+            "beamer_gaussian": dict(beamer_fit),
             "beam_energy_keV": None if beam_energy_keV is None else float(beam_energy_keV),
             "resist_thickness_nm": None if resist_thickness_nm is None else float(resist_thickness_nm),
             "resist_material_name": resist_material_name,
@@ -2329,12 +2338,18 @@ class StackDesignerApp:
         self._show_text_dialog("PEC Fit Result", msg, width=720, height=420)
 
     def _beamer_gaussian_text(self, res):
+        beamer = res.get("beamer_gaussian") or (res.get("fit_candidates") or {}).get("beamer_gaussian")
         dg = (res.get("fit_candidates") or {}).get("double_gaussian")
-        if not dg:
+        if not beamer and not dg:
             return ""
-        alpha_um = float(dg.get("alpha_nm", float("nan"))) / 1000.0
-        beta_um = float(dg.get("beta_nm", float("nan"))) / 1000.0
-        eta = float(dg.get("eta_fit", float("nan")))
+        src = beamer or dg
+        alpha_um = float(src.get("alpha_nm", float("nan"))) / 1000.0
+        beta_um = float(src.get("beta_nm", float("nan"))) / 1000.0
+        eta = float(src.get("eta_fit", float("nan")))
+        gamma1_um = float(src.get("gamma1_nm", 0.0) or 0.0) / 1000.0
+        nue1 = float(src.get("nue1", 0.0) or 0.0)
+        gamma2_um = float(src.get("gamma2_nm", 0.0) or 0.0) / 1000.0
+        nue2 = float(src.get("nue2", 0.0) or 0.0)
         fwhm_um = 0.03
         beam = self.project.get("beam", {})
         try:
@@ -2348,13 +2363,13 @@ class StackDesignerApp:
             f"Alpha [um]: {alpha_um:.6f}\n"
             f"Beta [um]: {beta_um:.6f}\n"
             f"Eta: {eta:.6f}\n"
-            "Gamma1 [um]: 0\n"
-            "Nue1: 0\n"
-            "Gamma2 [um]: 0\n"
-            "Nue2: 0\n"
+            f"Gamma1 [um]: {gamma1_um:.6f}\n"
+            f"Nue1: {nue1:.6f}\n"
+            f"Gamma2 [um]: {gamma2_um:.6f}\n"
+            f"Nue2: {nue2:.6f}\n"
             f"Effective short-range blur FWHM [um]: {fwhm_um:.6f}\n"
-            f"Double-Gaussian candidate MSE: {float(dg.get('mse', float('nan'))):.6g}\n"
-            "Note: Alpha/Beta/Eta above are the Gaussian-equivalent values for BEAMER. "
+            f"BEAMER Gaussian MSE: {float(src.get('mse', float('nan'))):.6g}\n"
+            "Note: Alpha/Beta/Eta/Gamma1/Nue1 above are Gaussian-equivalent values for BEAMER. "
             "They are shown even when the selected physical fit is Power-Gaussian."
         )
 
@@ -2453,6 +2468,114 @@ class StackDesignerApp:
             np.geomspace(max(1e-3, e0 / 5), e0 * 5, 50),
         )
         return refined
+
+    def _fit_beamer_gaussian_grid(
+        self,
+        x_nm,
+        y_log10_density,
+        fit_ring_area,
+        fit_weights=None,
+        double_gaussian_seed=None,
+    ):
+        _ensure_numpy()
+        x = np.asarray(x_nm, dtype=float)
+        y = np.asarray(y_log10_density, dtype=float)
+        ring_area = np.asarray(fit_ring_area, dtype=float)
+        weights = np.ones_like(x) if fit_weights is None else np.asarray(fit_weights, dtype=float)
+        if len(x) != len(ring_area) or len(x) != len(weights):
+            raise ValueError("BEAMER fit window mismatch.")
+
+        seed = double_gaussian_seed or {}
+        seed_alpha = float(seed.get("alpha_nm", 10.0) or 10.0)
+        seed_beta = float(seed.get("beta_nm", 5000.0) or 5000.0)
+        seed_eta = float(seed.get("eta_fit", 1.0) or 1.0)
+        seed_alpha = max(1.0, seed_alpha)
+        seed_beta = max(seed_alpha * 3.0, seed_beta)
+
+        # Downsample for a fast BEAMER-oriented fit while keeping log-spaced radius coverage.
+        if x.size > 850:
+            idx = np.unique(np.round(np.geomspace(1, x.size - 1, 850)).astype(int))
+            x = x[idx]
+            y = y[idx]
+            ring_area = ring_area[idx]
+            weights = weights[idx]
+
+        density = 10.0 ** y
+        x2 = x * x
+        sqrt_w = np.sqrt(np.clip(weights, 1e-12, None))
+        weighted_target = sqrt_w * density
+
+        def normalized_gaussian(width_nm):
+            comp = np.exp(-x2 / max(float(width_nm) ** 2, 1e-24))
+            comp /= max(float(np.sum(comp * ring_area)), 1e-300)
+            return comp
+
+        def score_grid(alpha_grid, gamma_grid, beta_grid):
+            best_local = None
+            for alpha_nm in alpha_grid:
+                alpha_nm = float(alpha_nm)
+                alpha_comp = normalized_gaussian(alpha_nm)
+                for gamma_nm in gamma_grid:
+                    gamma_nm = float(gamma_nm)
+                    if gamma_nm <= alpha_nm * 1.15:
+                        continue
+                    gamma_comp = normalized_gaussian(gamma_nm)
+                    for beta_nm in beta_grid:
+                        beta_nm = float(beta_nm)
+                        if beta_nm <= gamma_nm * 1.15:
+                            continue
+                        beta_comp = normalized_gaussian(beta_nm)
+                        model = np.vstack((alpha_comp, beta_comp, gamma_comp)).T
+                        weighted_model = model * sqrt_w[:, None]
+                        try:
+                            coeffs = np.linalg.lstsq(weighted_model, weighted_target, rcond=None)[0]
+                        except Exception:
+                            continue
+                        if not np.all(np.isfinite(coeffs)):
+                            continue
+                        if coeffs[0] <= 0.0 or coeffs[1] <= 0.0 or coeffs[2] <= 0.0:
+                            continue
+                        pred = model @ coeffs
+                        log_pred = np.log10(np.clip(pred, 1e-300, None))
+                        err = float(np.sum(weights * (log_pred - y) ** 2) / max(float(np.sum(weights)), 1e-300))
+                        if best_local is None or err < best_local["mse"]:
+                            best_local = {
+                                "alpha_nm": alpha_nm,
+                                "beta_nm": beta_nm,
+                                "eta_fit": float(coeffs[1] / coeffs[0]),
+                                "gamma1_nm": gamma_nm,
+                                "nue1": float(coeffs[2] / coeffs[0]),
+                                "gamma2_nm": 0.0,
+                                "nue2": 0.0,
+                                "mse": err,
+                            }
+            return best_local
+
+        gamma_lo = max(seed_alpha * 1.4, 15.0)
+        gamma_hi = max(gamma_lo * 1.4, min(seed_beta / 1.25, max(120.0, seed_beta * 0.65)))
+        coarse = score_grid(
+            np.geomspace(max(1.0, seed_alpha / 2.5), seed_alpha * 2.5, 13),
+            np.geomspace(gamma_lo, gamma_hi, 24),
+            np.geomspace(max(gamma_lo * 1.3, seed_beta / 2.4), min(140000.0, seed_beta * 2.4), 18),
+        )
+        if coarse is None:
+            return {
+                "alpha_nm": seed_alpha,
+                "beta_nm": seed_beta,
+                "eta_fit": seed_eta,
+                "gamma1_nm": 0.0,
+                "nue1": 0.0,
+                "gamma2_nm": 0.0,
+                "nue2": 0.0,
+                "mse": float(seed.get("mse", float("nan"))),
+            }
+
+        refined = score_grid(
+            np.geomspace(max(1.0, coarse["alpha_nm"] / 1.8), coarse["alpha_nm"] * 1.8, 15),
+            np.geomspace(max(coarse["alpha_nm"] * 1.2, coarse["gamma1_nm"] / 2.0), coarse["gamma1_nm"] * 2.0, 24),
+            np.geomspace(max(coarse["gamma1_nm"] * 1.2, coarse["beta_nm"] / 1.9), min(140000.0, coarse["beta_nm"] * 1.9), 20),
+        )
+        return refined or coarse
 
     def _fit_power_gaussian_grid(
         self,

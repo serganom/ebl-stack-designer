@@ -34,6 +34,7 @@ It is not meant to replace a fully calibrated production simulator.
   - power-Gaussian composite
 - weighted fitting with center-priority
 - automatic noisy-tail cutoff during fit preparation
+- BEAMER Gaussian Approximation output in micrometers, including `Alpha`, `Beta`, `Eta`, `Gamma1`, and `Nue1`
 - fit plot viewer
 - live Monte Carlo progress window with:
   - electron count
