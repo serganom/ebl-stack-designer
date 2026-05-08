@@ -35,6 +35,7 @@ It is not meant to replace a fully calibrated production simulator.
 - weighted fitting with center-priority
 - automatic noisy-tail cutoff during fit preparation
 - BEAMER Gaussian Approximation output in micrometers, including `Alpha`, `Beta`, `Eta`, `Gamma1`, and `Nue1`
+- editable BEAMER short-range blur FWHM value in the simulation dialog
 - fit plot viewer
 - live Monte Carlo progress window with:
   - electron count

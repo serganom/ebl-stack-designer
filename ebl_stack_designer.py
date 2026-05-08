@@ -1561,6 +1561,7 @@ class StackDesignerApp:
             "electrons": "3000",
             "max_radius_nm": "50000",
             "forward_nm": "100",
+            "beamer_fwhm_um": "0.030",
             "seed": "12345",
             "max_collisions_per_electron": "4000",
             "min_energy_keV": "0.05",
@@ -1592,6 +1593,7 @@ class StackDesignerApp:
             ("Electrons (N)", "electrons"),
             ("Max radius for histogram (nm)", "max_radius_nm"),
             ("Forward split radius for eta (nm)", "forward_nm"),
+            ("BEAMER short-range FWHM (um)", "beamer_fwhm_um"),
             ("Random seed", "seed"),
             ("Max collisions / electron", "max_collisions_per_electron"),
             ("Min energy stop (keV)", "min_energy_keV"),
@@ -1617,6 +1619,7 @@ class StackDesignerApp:
                     "electrons": int(float(vars_["electrons"].get())),
                     "max_radius_nm": int(float(vars_["max_radius_nm"].get())),
                     "forward_nm": float(vars_["forward_nm"].get()),
+                    "beamer_fwhm_um": float(vars_["beamer_fwhm_um"].get()),
                     "seed": int(float(vars_["seed"].get())),
                     "max_collisions_per_electron": int(float(vars_["max_collisions_per_electron"].get())),
                     "min_energy_keV": float(vars_["min_energy_keV"].get()),
@@ -1627,6 +1630,8 @@ class StackDesignerApp:
                     raise ValueError("Max radius must be >= 1000 nm.")
                 if params["forward_nm"] <= 0:
                     raise ValueError("Forward split radius must be > 0.")
+                if params["beamer_fwhm_um"] < 0:
+                    raise ValueError("BEAMER short-range FWHM must be >= 0.")
                 dlg.destroy()
                 self._run_standalone_mc_job(params)
             except Exception as exc:
@@ -1710,6 +1715,7 @@ class StackDesignerApp:
                 resist_material_name=sim.get("resist_layer_name"),
                 beam_sigma_nm=sim.get("beam_sigma_nm"),
             )
+            res["beamer_fwhm_um"] = float(params.get("beamer_fwhm_um", 0.03))
             res["simulation"] = {
                 "engine": "standalone_mc_rutherford_bethe_like",
                 "electrons": params["electrons"],
@@ -1717,6 +1723,7 @@ class StackDesignerApp:
                 "elapsed_s": time.time() - t0,
                 "max_collisions_per_electron": params["max_collisions_per_electron"],
                 "min_energy_keV": params["min_energy_keV"],
+                "beamer_fwhm_um": float(params.get("beamer_fwhm_um", 0.03)),
                 "beam_energy_keV": self.project.get("beam", {}).get("energy_keV"),
                 "resist_layer_index": params["resist_layer_index"],
                 "resist_layer_indices": params.get("resist_layer_indices", [params["resist_layer_index"]]),
@@ -2350,14 +2357,10 @@ class StackDesignerApp:
         nue1 = float(src.get("nue1", 0.0) or 0.0)
         gamma2_um = float(src.get("gamma2_nm", 0.0) or 0.0) / 1000.0
         nue2 = float(src.get("nue2", 0.0) or 0.0)
-        fwhm_um = 0.03
-        beam = self.project.get("beam", {})
         try:
-            beam_diam_nm = float(beam.get("beam_diameter_nm") or 0.0)
-            if beam_diam_nm > 0:
-                fwhm_um = beam_diam_nm / 1000.0
+            fwhm_um = float(res.get("beamer_fwhm_um", 0.03))
         except Exception:
-            pass
+            fwhm_um = 0.03
         return (
             "\n\nBEAMER Gaussian Approximation (um)\n"
             f"Alpha [um]: {alpha_um:.6f}\n"
