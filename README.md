@@ -38,6 +38,7 @@ It is not meant to replace a fully calibrated production simulator.
 - editable BEAMER short-range blur FWHM value in the simulation dialog
 - BEAMER-ready micrometer parameters shown directly on the PEC fit plot
 - optional BEAMER Gaussian approximation curve shown on the same PEC plot as the selected physical fit
+- PSF curve export as BEAMER-style two-column `.psf` or full diagnostic `.csv`
 - fit plot viewer
 - live Monte Carlo progress window with:
   - electron count

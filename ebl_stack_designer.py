@@ -795,6 +795,7 @@ class StackDesignerApp:
         ttk.Label(sim_toolbar, text="Simulation:").pack(side="left", padx=(0, 4))
         ttk.Button(sim_toolbar, text="Run Simulation + Fit αβη", command=self.run_standalone_sim_and_fit).pack(side="left", padx=2)
         ttk.Button(sim_toolbar, text="Plot Last PEC Fit", command=self.plot_last_fit).pack(side="left", padx=4)
+        ttk.Button(sim_toolbar, text="Export PSF Curve", command=self.export_psf_curve).pack(side="left", padx=4)
 
         file_toolbar = ttk.Frame(actions)
         file_toolbar.grid(row=3, column=0, sticky="w", padx=6, pady=(2, 4))
@@ -1507,6 +1508,91 @@ class StackDesignerApp:
             messagebox.showinfo("Exported", f"Exported summary to:\n{path}")
         except Exception as exc:
             messagebox.showerror("Export Error", str(exc))
+
+    def export_psf_curve(self):
+        try:
+            res = self.last_fit_result
+            if not res:
+                fits = self.project.get("pec_fits", [])
+                res = fits[-1] if fits else None
+            if not res:
+                raise ValueError("No PEC fit available. Run Simulation + Fit first.")
+            plot_data = res.get("plot_data") or {}
+            r_nm = plot_data.get("r_nm") or []
+            y_fit = plot_data.get("fitted_density") or []
+            if not r_nm or not y_fit:
+                raise ValueError("Last PEC fit does not contain PSF curve data.")
+
+            default_name = "ebl_psf_curve.psf"
+            path = filedialog.asksaveasfilename(
+                title="Export PSF Curve",
+                defaultextension=".psf",
+                initialfile=default_name,
+                filetypes=[
+                    ("BEAMER-style PSF two-column", "*.psf"),
+                    ("CSV table", "*.csv"),
+                    ("Text", "*.txt"),
+                    ("All files", "*.*"),
+                ],
+            )
+            if not path:
+                return
+
+            ext = path.lower().rsplit(".", 1)[-1] if "." in path else "psf"
+            if ext == "csv":
+                self._write_psf_csv(path, res)
+                message = (
+                    "Exported PSF CSV table.\n\n"
+                    "Columns include radius_um, measured density, selected physical fit, "
+                    "and BEAMER Gaussian fit when available."
+                )
+            else:
+                self._write_psf_two_column(path, res)
+                message = (
+                    "Exported BEAMER-style PSF curve.\n\n"
+                    "Format: radius_um  selected_fit_density_per_um2\n"
+                    "No header is written for maximum compatibility with numerical PSF import."
+                )
+            messagebox.showinfo("PSF Exported", f"{message}\n\n{path}")
+        except Exception as exc:
+            messagebox.showerror("Export PSF Error", str(exc))
+
+    def _write_psf_two_column(self, path, fit_result):
+        _ensure_numpy()
+        plot_data = fit_result.get("plot_data") or {}
+        r_nm = np.asarray(plot_data.get("r_nm", []), dtype=float)
+        y_fit = np.asarray(plot_data.get("fitted_density", []), dtype=float)
+        if r_nm.size == 0 or y_fit.size != r_nm.size:
+            raise ValueError("Invalid PSF curve data.")
+        radius_um = r_nm / 1000.0
+        density_per_um2 = y_fit * 1.0e6
+        mask = np.isfinite(radius_um) & np.isfinite(density_per_um2) & (radius_um > 0) & (density_per_um2 > 0)
+        with open(path, "w", encoding="utf-8") as f:
+            for x_um, val in zip(radius_um[mask], density_per_um2[mask]):
+                f.write(f"{x_um:.9g} {val:.12e}\n")
+
+    def _write_psf_csv(self, path, fit_result):
+        _ensure_numpy()
+        plot_data = fit_result.get("plot_data") or {}
+        r_nm = np.asarray(plot_data.get("r_nm", []), dtype=float)
+        y_meas = np.asarray(plot_data.get("measured_density", []), dtype=float)
+        y_fit = np.asarray(plot_data.get("fitted_density", []), dtype=float)
+        y_beamer = np.asarray(plot_data.get("beamer_gaussian_density", []), dtype=float)
+        if r_nm.size == 0 or y_fit.size != r_nm.size:
+            raise ValueError("Invalid PSF curve data.")
+        if y_meas.size != r_nm.size:
+            y_meas = np.full_like(r_nm, float("nan"))
+        if y_beamer.size != r_nm.size:
+            y_beamer = np.full_like(r_nm, float("nan"))
+        radius_um = r_nm / 1000.0
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("# EBL Stack Designer PSF export\n")
+            f.write("# made by Sergei Nomoev\n")
+            f.write(f"# model,{self._fit_model_display_name(fit_result)}\n")
+            f.write("# density columns are converted from 1/nm^2 to 1/um^2\n")
+            f.write("radius_um,measured_density_per_um2,selected_fit_density_per_um2,beamer_gaussian_density_per_um2\n")
+            for row in zip(radius_um, y_meas * 1.0e6, y_fit * 1.0e6, y_beamer * 1.0e6):
+                f.write(",".join(f"{float(v):.12e}" for v in row) + "\n")
 
     def get_material(self, name):
         for m in self.materials:
