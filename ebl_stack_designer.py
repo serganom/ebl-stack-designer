@@ -2307,6 +2307,7 @@ class StackDesignerApp:
         self._sim_progress_win = None
 
     def _show_fit_result_dialog(self, res):
+        beamer_txt = self._beamer_gaussian_text(res)
         msg = (
             "PEC fit complete\n\n"
             f"Model: {self._fit_model_display_name(res)}\n"
@@ -2323,8 +2324,39 @@ class StackDesignerApp:
             f"Fit weighting: {res.get('fit_weighting', '')}\n"
             f"Fit MSE (log10 density): {res['fit_mse']:.6g}\n"
             f"PEC guidance: {res.get('pec_guidance', '')}"
+            f"{beamer_txt}"
         )
         self._show_text_dialog("PEC Fit Result", msg, width=720, height=420)
+
+    def _beamer_gaussian_text(self, res):
+        dg = (res.get("fit_candidates") or {}).get("double_gaussian")
+        if not dg:
+            return ""
+        alpha_um = float(dg.get("alpha_nm", float("nan"))) / 1000.0
+        beta_um = float(dg.get("beta_nm", float("nan"))) / 1000.0
+        eta = float(dg.get("eta_fit", float("nan")))
+        fwhm_um = 0.03
+        beam = self.project.get("beam", {})
+        try:
+            beam_diam_nm = float(beam.get("beam_diameter_nm") or 0.0)
+            if beam_diam_nm > 0:
+                fwhm_um = beam_diam_nm / 1000.0
+        except Exception:
+            pass
+        return (
+            "\n\nBEAMER Gaussian Approximation (um)\n"
+            f"Alpha [um]: {alpha_um:.6f}\n"
+            f"Beta [um]: {beta_um:.6f}\n"
+            f"Eta: {eta:.6f}\n"
+            "Gamma1 [um]: 0\n"
+            "Nue1: 0\n"
+            "Gamma2 [um]: 0\n"
+            "Nue2: 0\n"
+            f"Effective short-range blur FWHM [um]: {fwhm_um:.6f}\n"
+            f"Double-Gaussian candidate MSE: {float(dg.get('mse', float('nan'))):.6g}\n"
+            "Note: Alpha/Beta/Eta above are the Gaussian-equivalent values for BEAMER. "
+            "They are shown even when the selected physical fit is Power-Gaussian."
+        )
 
     def _store_fit_result(self, res):
         fit_record = dict(res)
