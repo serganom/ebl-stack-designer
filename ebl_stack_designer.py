@@ -2056,6 +2056,13 @@ class StackDesignerApp:
             fit_weights=fit_weights,
             double_gaussian_seed=best_dg,
         )
+        beamer_plot_density = self._beamer_gaussian_density(
+            x,
+            fit_ring_area,
+            beamer_fit,
+            target_y_log10_density=y,
+            fit_weights=fit_weights,
+        )
 
         prefer_pg = _is_high_tension_thin_resist(beam_energy_keV, resist_thickness_nm)
         if prefer_pg:
@@ -2084,6 +2091,7 @@ class StackDesignerApp:
                 "r_nm": best["plot_r_nm"],
                 "measured_density": best["plot_measured_density"],
                 "fitted_density": best["plot_fitted_density"],
+                "beamer_gaussian_density": beamer_plot_density.tolist(),
             },
             "fit_candidates": {
                 "double_gaussian": {
@@ -2607,6 +2615,52 @@ class StackDesignerApp:
         )
         return refined or coarse
 
+    def _beamer_gaussian_density(
+        self,
+        x_nm,
+        ring_area,
+        beamer_fit,
+        target_y_log10_density=None,
+        fit_weights=None,
+    ):
+        _ensure_numpy()
+        x = np.asarray(x_nm, dtype=float)
+        area = np.asarray(ring_area, dtype=float)
+        x2 = x * x
+
+        def normalized_gaussian(width_nm):
+            comp = np.exp(-x2 / max(float(width_nm) ** 2, 1e-24))
+            comp /= max(float(np.sum(comp * area)), 1e-300)
+            return comp
+
+        alpha = normalized_gaussian(float(beamer_fit.get("alpha_nm", 1.0) or 1.0))
+        beta = normalized_gaussian(float(beamer_fit.get("beta_nm", 1000.0) or 1000.0))
+        gamma1_nm = float(beamer_fit.get("gamma1_nm", 0.0) or 0.0)
+        gamma2_nm = float(beamer_fit.get("gamma2_nm", 0.0) or 0.0)
+        eta = max(0.0, float(beamer_fit.get("eta_fit", 0.0) or 0.0))
+        nue1 = max(0.0, float(beamer_fit.get("nue1", 0.0) or 0.0))
+        nue2 = max(0.0, float(beamer_fit.get("nue2", 0.0) or 0.0))
+        numerator = alpha + eta * beta
+        denom = 1.0 + eta
+        if gamma1_nm > 0.0 and nue1 > 0.0:
+            numerator = numerator + nue1 * normalized_gaussian(gamma1_nm)
+            denom += nue1
+        if gamma2_nm > 0.0 and nue2 > 0.0:
+            numerator = numerator + nue2 * normalized_gaussian(gamma2_nm)
+            denom += nue2
+        density = numerator / max(denom, 1e-300)
+
+        if target_y_log10_density is not None:
+            target = np.asarray(target_y_log10_density, dtype=float)
+            weights = np.ones_like(x) if fit_weights is None else np.asarray(fit_weights, dtype=float)
+            log_density = np.log10(np.clip(density, 1e-300, None))
+            offset = float(
+                np.sum(weights * (target - log_density))
+                / max(float(np.sum(weights)), 1e-300)
+            )
+            density = density * (10.0 ** offset)
+        return density
+
     def _fit_power_gaussian_grid(
         self,
         x_nm,
@@ -2703,9 +2757,12 @@ class StackDesignerApp:
         r = np.asarray(plot_data.get("r_nm", []), dtype=float)
         y_meas = np.asarray(plot_data.get("measured_density", []), dtype=float)
         y_fit = np.asarray(plot_data.get("fitted_density", []), dtype=float)
+        y_beamer = np.asarray(plot_data.get("beamer_gaussian_density", []), dtype=float)
         if r.size == 0 or y_meas.size == 0 or y_fit.size == 0:
             messagebox.showerror("Plot PEC Fit", "Stored plot data is empty.")
             return
+        if y_beamer.size != r.size:
+            y_beamer = np.asarray([], dtype=float)
 
         if res.get("fit_model") == "power_gaussian":
             title = (
@@ -2726,6 +2783,15 @@ class StackDesignerApp:
             ax = fig.add_subplot(111)
             ax.loglog(r, y_meas, '.', markersize=3, label='Measured (simulation histogram)')
             ax.loglog(r, y_fit, '-', linewidth=1.5, label=fit_label)
+            if y_beamer.size:
+                ax.loglog(
+                    r,
+                    y_beamer,
+                    '--',
+                    linewidth=1.35,
+                    color='tab:green',
+                    label='BEAMER Gaussian approximation',
+                )
             ax.set_xlabel('Radius (nm)')
             ax.set_ylabel('Deposited energy density (normalized, 1/nm^2)')
             ax.set_title(title)
@@ -2752,9 +2818,9 @@ class StackDesignerApp:
             mpl.show()
             return
 
-        self._plot_last_fit_tk(r, y_meas, y_fit, title, beamer_annotation)
+        self._plot_last_fit_tk(r, y_meas, y_fit, title, beamer_annotation, y_beamer)
 
-    def _plot_last_fit_tk(self, r, y_meas, y_fit, title, beamer_annotation=""):
+    def _plot_last_fit_tk(self, r, y_meas, y_fit, title, beamer_annotation="", y_beamer=None):
         win = tk.Toplevel(self.root)
         win.title("PEC Fit Plot (Tk fallback)")
         _configure_toplevel(win, self.root, width=900, height=650, min_width=520, min_height=360)
@@ -2783,10 +2849,12 @@ class StackDesignerApp:
 
             m1 = (r > 0) & (y_meas > 0)
             m2 = (r > 0) & (y_fit > 0)
+            yb = np.asarray([] if y_beamer is None else y_beamer, dtype=float)
+            mb = (r > 0) & (yb > 0) if yb.size == r.size else np.zeros_like(r, dtype=bool)
             if not np.any(m1) or not np.any(m2):
                 return
-            x_all = np.concatenate([r[m1], r[m2]])
-            y_all = np.concatenate([y_meas[m1], y_fit[m2]])
+            x_all = np.concatenate([r[m1], r[m2], r[mb]]) if np.any(mb) else np.concatenate([r[m1], r[m2]])
+            y_all = np.concatenate([y_meas[m1], y_fit[m2], yb[mb]]) if np.any(mb) else np.concatenate([y_meas[m1], y_fit[m2]])
             lx0, lx1 = np.log10(np.min(x_all)), np.log10(np.max(x_all))
             ly0, ly1 = np.log10(np.min(y_all)), np.log10(np.max(y_all))
             if lx1 <= lx0 or ly1 <= ly0:
@@ -2833,14 +2901,29 @@ class StackDesignerApp:
             if len(coords) >= 4:
                 canvas.create_line(*coords, fill="#d62728", width=2, smooth=False)
 
+            # BEAMER Gaussian approximation line
+            if np.any(mb):
+                rrb = r[mb]
+                yyb = yb[mb]
+                coords = []
+                step = max(1, len(rrb) // 1500)
+                for xv, yv in zip(rrb[::step], yyb[::step]):
+                    coords.extend([float(xmap(xv)), float(ymap(yv))])
+                if len(coords) >= 4:
+                    canvas.create_line(*coords, fill="#2ca02c", width=2, dash=(7, 4), smooth=False)
+
             # Legend
             lx = left + 10
             ly = top + 10
-            canvas.create_rectangle(lx, ly, lx + 180, ly + 40, fill="white", outline="#bbb")
+            legend_h = 58 if np.any(mb) else 40
+            canvas.create_rectangle(lx, ly, lx + 230, ly + legend_h, fill="white", outline="#bbb")
             canvas.create_oval(lx + 8, ly + 9, lx + 12, ly + 13, fill="#1f77b4", outline="")
             canvas.create_text(lx + 20, ly + 11, text="Measured (histogram)", anchor="w", font=("Helvetica", 9))
             canvas.create_line(lx + 8, ly + 28, lx + 18, ly + 28, fill="#d62728", width=2)
             canvas.create_text(lx + 20, ly + 28, text=fit_label, anchor="w", font=("Helvetica", 9))
+            if np.any(mb):
+                canvas.create_line(lx + 8, ly + 45, lx + 18, ly + 45, fill="#2ca02c", width=2, dash=(7, 4))
+                canvas.create_text(lx + 20, ly + 45, text="BEAMER Gaussian", anchor="w", font=("Helvetica", 9))
 
             canvas.create_text(left + pw / 2, h - 15, text="Radius (nm) [log scale]", font=("Helvetica", 10))
             canvas.create_text(15, top + ph / 2, text="Density\n(log)", font=("Helvetica", 10))

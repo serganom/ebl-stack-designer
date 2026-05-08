@@ -37,6 +37,7 @@ It is not meant to replace a fully calibrated production simulator.
 - BEAMER Gaussian Approximation output in micrometers, including `Alpha`, `Beta`, `Eta`, `Gamma1`, and `Nue1`
 - editable BEAMER short-range blur FWHM value in the simulation dialog
 - BEAMER-ready micrometer parameters shown directly on the PEC fit plot
+- optional BEAMER Gaussian approximation curve shown on the same PEC plot as the selected physical fit
 - fit plot viewer
 - live Monte Carlo progress window with:
   - electron count
