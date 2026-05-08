@@ -113,7 +113,17 @@ This is intentional, because the physically important forward-scattering region 
 
 The code can also cut the far tail automatically when the histogram becomes noise-dominated. This avoids dragging the whole fit toward sparse long-range Monte Carlo noise.
 
-## 9. Scope
+## 9. PSF Curve Export
+
+The fitted radial PSF curve can be exported in three forms:
+
+- `.lpsf`: zlib-compressed `LPSF_2012` XML archive for BEAMER-style numerical PSF import
+- `.psf`: simple two-column text table, `radius_um` and selected fitted density in `1/um^2`
+- `.csv`: diagnostic table with measured histogram, selected physical fit, and BEAMER Gaussian approximation
+
+For `.lpsf`, the selected physical fit curve is resampled onto an exponential radial grid with 50 points per decade, similar to common mcTrace/BEAMER PSF archives. The amplitude is scaled as a relative PSF; the important quantity for PEC import is the radial shape, while BEAMER can normalize the numerical PSF internally.
+
+## 10. Scope
 
 This is an engineering approximation for rapid PEC exploration inside a GUI workflow.
 

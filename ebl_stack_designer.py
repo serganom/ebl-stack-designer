@@ -3,8 +3,10 @@ import math
 import time
 import random
 import sys
+import zlib
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+from xml.sax.saxutils import escape as xml_escape
 np = None
 plt = None
 
@@ -1523,12 +1525,13 @@ class StackDesignerApp:
             if not r_nm or not y_fit:
                 raise ValueError("Last PEC fit does not contain PSF curve data.")
 
-            default_name = "ebl_psf_curve.psf"
+            default_name = "ebl_psf_curve.lpsf"
             path = filedialog.asksaveasfilename(
                 title="Export PSF Curve",
-                defaultextension=".psf",
+                defaultextension=".lpsf",
                 initialfile=default_name,
                 filetypes=[
+                    ("BEAMER LPSF archive", "*.lpsf"),
                     ("BEAMER-style PSF two-column", "*.psf"),
                     ("CSV table", "*.csv"),
                     ("Text", "*.txt"),
@@ -1539,7 +1542,14 @@ class StackDesignerApp:
                 return
 
             ext = path.lower().rsplit(".", 1)[-1] if "." in path else "psf"
-            if ext == "csv":
+            if ext == "lpsf":
+                self._write_lpsf_archive(path, res)
+                message = (
+                    "Exported BEAMER LPSF archive.\n\n"
+                    "Format: zlib-compressed LPSF_2012 XML, compatible with BEAMER-style "
+                    "numerical PSF import. The curve is the selected physical fitted PSF."
+                )
+            elif ext == "csv":
                 self._write_psf_csv(path, res)
                 message = (
                     "Exported PSF CSV table.\n\n"
@@ -1593,6 +1603,267 @@ class StackDesignerApp:
             f.write("radius_um,measured_density_per_um2,selected_fit_density_per_um2,beamer_gaussian_density_per_um2\n")
             for row in zip(radius_um, y_meas * 1.0e6, y_fit * 1.0e6, y_beamer * 1.0e6):
                 f.write(",".join(f"{float(v):.12e}" for v in row) + "\n")
+
+    def _write_lpsf_archive(self, path, fit_result):
+        points, curve_meta = self._build_lpsf_curve_points(fit_result)
+        stack = fit_result.get("stack_snapshot") or self.project.get("stack", [])
+        stack = [dict(layer) for layer in stack]
+        sim = fit_result.get("simulation") or {}
+
+        beam = dict(fit_result.get("beam") or self.project.get("beam", {}))
+        energy_keV = fit_result.get("beam_energy_keV") or sim.get("beam_energy_keV") or beam.get("energy_keV") or 0.0
+        try:
+            energy_keV = float(energy_keV)
+        except Exception:
+            energy_keV = 0.0
+        try:
+            electrons = int(float(sim.get("electrons", 0) or 0))
+        except Exception:
+            electrons = 0
+        try:
+            beam_diam_nm = float(beam.get("beam_diameter_nm", 0.0) or 0.0)
+        except Exception:
+            beam_diam_nm = 0.0
+        injection_radius_nm = max(0.0, beam_diam_nm / 2.355) if beam_diam_nm > 0 else 0.0
+        try:
+            min_energy_eV = float(sim.get("min_energy_keV", 0.0) or 0.0) * 1000.0
+        except Exception:
+            min_energy_eV = 0.0
+        try:
+            resist_thickness_nm = float(fit_result.get("resist_thickness_nm", 0.0) or 0.0)
+        except Exception:
+            resist_thickness_nm = 0.0
+        z_position_um = max(0.0, resist_thickness_nm / 2000.0)
+        mesh_z_size_nm = 10.0
+        mesh_z_count = max(1, int(math.ceil(resist_thickness_nm / mesh_z_size_nm)) + 1) if resist_thickness_nm > 0 else 1
+
+        comments = self._lpsf_comment_lines(
+            stack=stack,
+            point_count=len(points),
+            mesh_z_count=mesh_z_count,
+            mesh_z_size_nm=mesh_z_size_nm,
+            energy_keV=energy_keV,
+            injection_radius_nm=injection_radius_nm,
+            min_energy_eV=min_energy_eV,
+            electrons=electrons,
+            curve_meta=curve_meta,
+            fit_result=fit_result,
+        )
+
+        lines = [
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>',
+            '<!DOCTYPE boost_serialization>',
+            '<boost_serialization signature="serialization::archive" version="8">',
+            '<LPSF_2012 class_id="0" tracking_level="0" version="1">',
+            '\t<m_Comments class_id="1" tracking_level="0" version="0">',
+            f'\t\t<count>{len(comments)}</count>',
+            '\t\t<item_version>0</item_version>',
+        ]
+        for item in comments:
+            lines.append(f'\t\t<item>{xml_escape(str(item))}</item>')
+        lines.extend([
+            '\t</m_Comments>',
+            '\t<m_PSFDataOriginal class_id="2" tracking_level="0" version="0">',
+            f'\t\t<count>{len(points)}</count>',
+            '\t\t<item_version>0</item_version>',
+        ])
+        for i, (x_nm, y_val) in enumerate(points):
+            item_open = (
+                '\t\t<item class_id="3" tracking_level="0" version="0">'
+                if i == 0 else
+                '\t\t<item>'
+            )
+            lines.extend([
+                item_open,
+                f'\t\t\t<m_x>{self._lpsf_num(x_nm)}</m_x>',
+                f'\t\t\t<m_y>{self._lpsf_num(y_val)}</m_y>',
+                '\t\t</item>',
+            ])
+        lines.extend([
+            '\t</m_PSFDataOriginal>',
+            '\t<m_bGaussFitted>0</m_bGaussFitted>',
+            f'\t<m_lBeam_Energy_kV>{self._lpsf_num(energy_keV)}</m_lBeam_Energy_kV>',
+            f'\t<m_dZ_Position>{self._lpsf_num(z_position_um)}</m_dZ_Position>',
+            f'\t<m_lElectrons>{electrons}</m_lElectrons>',
+            '\t<m_sSimulator>EBL Stack Designer standalone_mc</m_sSimulator>',
+            '\t<m_Stack class_id="4" tracking_level="0" version="0">',
+            f'\t\t<count>{len(stack)}</count>',
+            '\t\t<item_version>0</item_version>',
+        ])
+        for i, layer in enumerate(stack):
+            item_open = (
+                '\t\t<item class_id="5" tracking_level="0" version="0">'
+                if i == 0 else
+                '\t\t<item>'
+            )
+            material = str(layer.get("material_name", "Unknown"))
+            thickness_nm = float(layer.get("thickness_nm", 0.0) or 0.0)
+            lines.extend([
+                item_open,
+                f'\t\t\t<first>{xml_escape(material)}</first>',
+                f'\t\t\t<second>{self._lpsf_num(thickness_nm)}</second>',
+                '\t\t</item>',
+            ])
+        lines.extend([
+            '\t</m_Stack>',
+            '</LPSF_2012>',
+            '</boost_serialization>',
+            '',
+        ])
+
+        xml_text = "\n".join(lines)
+        with open(path, "wb") as f:
+            f.write(zlib.compress(xml_text.encode("utf-8"), level=6))
+
+    def _build_lpsf_curve_points(self, fit_result):
+        _ensure_numpy()
+        plot_data = fit_result.get("plot_data") or {}
+        r_nm = np.asarray(plot_data.get("r_nm", []), dtype=float)
+        y_fit = np.asarray(plot_data.get("fitted_density", []), dtype=float)
+        if r_nm.size == 0 or y_fit.size != r_nm.size:
+            raise ValueError("Invalid PSF curve data.")
+
+        mask = np.isfinite(r_nm) & np.isfinite(y_fit) & (r_nm > 0) & (y_fit > 0)
+        r_nm = r_nm[mask]
+        y_fit = y_fit[mask]
+        if r_nm.size < 2:
+            raise ValueError("Not enough positive PSF points for LPSF export.")
+
+        order = np.argsort(r_nm)
+        r_nm = r_nm[order]
+        y_fit = y_fit[order]
+        r_unique, unique_idx = np.unique(r_nm, return_index=True)
+        r_nm = r_unique
+        y_fit = y_fit[unique_idx]
+        if r_nm.size < 2:
+            raise ValueError("Not enough unique PSF radii for LPSF export.")
+
+        points_per_decade = 50
+        step_factor = 10.0 ** (1.0 / points_per_decade)
+        r_start_nm = 1.0
+        r_max_nm = max(r_start_nm * step_factor, float(r_nm[-1]))
+        decades = max(0.0, math.log10(r_max_nm / r_start_nm))
+        n_grid = int(math.ceil(decades * points_per_decade)) + 1
+        n_grid = max(2, min(1200, n_grid))
+        grid_r = r_start_nm * (step_factor ** np.arange(n_grid, dtype=float))
+        grid_r = grid_r[grid_r <= r_max_nm * (1.0 + 1e-12)]
+        if grid_r.size == 0:
+            grid_r = np.asarray([r_start_nm], dtype=float)
+        if grid_r[-1] < r_max_nm * 0.995:
+            grid_r = np.append(grid_r, r_max_nm)
+
+        log_r_src = np.log(np.clip(r_nm, 1e-300, None))
+        log_y_src = np.log(np.clip(y_fit, 1e-300, None))
+        log_y_grid = np.interp(np.log(grid_r), log_r_src, log_y_src, left=log_y_src[0], right=log_y_src[-1])
+        y_grid = np.exp(log_y_grid)
+
+        # LPSF curves are relative PSFs. Scale the numerical shape to a stable
+        # archive magnitude similar to mcTrace files; BEAMER normalizes on import.
+        if grid_r.size > 1:
+            integrand = 2.0 * math.pi * grid_r * y_grid
+            if hasattr(np, "trapezoid"):
+                ring_integral = float(np.trapezoid(integrand, grid_r))
+            else:
+                dr = grid_r[1:] - grid_r[:-1]
+                ring_integral = float(np.sum(0.5 * (integrand[1:] + integrand[:-1]) * dr))
+        else:
+            ring_integral = float(y_grid[0])
+        scale = 1.0e9 / ring_integral if ring_integral > 0 and math.isfinite(ring_integral) else 1.0e9
+        y_grid = y_grid * scale
+
+        points = [(0.0, float(y_grid[0]))]
+        points.extend((float(x), float(y)) for x, y in zip(grid_r, y_grid))
+        points.append((float(grid_r[-1] * step_factor), 0.0))
+        return points, {
+            "points_per_decade": points_per_decade,
+            "scale": scale,
+            "scaled_integral": ring_integral * scale,
+            "r_max_nm": float(grid_r[-1]),
+        }
+
+    def _lpsf_comment_lines(
+        self,
+        stack,
+        point_count,
+        mesh_z_count,
+        mesh_z_size_nm,
+        energy_keV,
+        injection_radius_nm,
+        min_energy_eV,
+        electrons,
+        curve_meta,
+        fit_result,
+    ):
+        now_txt = time.strftime("%Y-%b-%d %H:%M:%S")
+        comments = [
+            f"## PSF ARCHIVED on {now_txt}",
+            "   EBL Stack Designer standalone export",
+            "   made by Sergei Nomoev",
+            "#   Data Management  -------------------------------------------",
+            "",
+            "    RadialMode:                                      exponential",
+            f"    MeshRZNumberR:   {point_count}",
+            f"    MeshRZNumberZ:   {mesh_z_count}",
+            f"    AllocSizeRZ:     {point_count * max(1, mesh_z_count)}",
+            "    MeshRZR0/nm:     1",
+            f"    MeshRZSpD:       {int(curve_meta.get('points_per_decade', 50))}",
+            f"    MeshRZSizeZ/nm:  {self._lpsf_num(mesh_z_size_nm)}",
+            f"    ExportScale:     {self._lpsf_num(curve_meta.get('scale', 0.0))}",
+            "#",
+            "#   Material Stack  --------------------------------------------",
+            "",
+            "    StackDescriptor:                                    EBL Stack Designer",
+            f"    NumberOfLayers:  {len(stack)}",
+            "",
+        ]
+        for layer in stack:
+            material = str(layer.get("material_name", "Unknown"))
+            thickness_nm = float(layer.get("thickness_nm", 0.0) or 0.0)
+            role = str(layer.get("role", ""))
+            lay_flag = 1 if role.lower() == "resist" else 0
+            comments.extend([
+                f"    MaterialDescriptor: {material}",
+                f"    Thickness/nm:       {self._lpsf_num(thickness_nm)}",
+                f"    LayFlag:            {lay_flag}",
+                "",
+            ])
+        comments.extend([
+            "#",
+            "#   Simulation Parameters  -------------------------------------",
+            "",
+            f"    Injection Energy/eV:          {self._lpsf_num(float(energy_keV) * 1000.0)}",
+            f"    Gaussian Injection Radius/nm: {self._lpsf_num(injection_radius_nm)}",
+            f"    SE Cutoff Energy/eV:          {self._lpsf_num(min_energy_eV)}",
+            "    Simulator:                    EBL Stack Designer standalone_mc",
+            "#",
+            "#   PEC Fit  ----------------------------------------------------",
+            "",
+            f"    FitModel:                     {self._fit_model_display_name(fit_result)}",
+            f"    LayerPattern:                 {fit_result.get('layer_pattern', '')}",
+            f"    Beta/nm:                      {self._lpsf_num(fit_result.get('beta_nm', 0.0))}",
+            f"    Eta:                          {self._lpsf_num(fit_result.get('eta_fit', 0.0))}",
+            f"    FitWindowMax/nm:              {self._lpsf_num(fit_result.get('fit_window_max_nm', 0.0))}",
+            "#",
+            "#   Simulation Status & Statistics  ----------------------------",
+            "",
+            "    Traced Electrons",
+            f"      - primary:  {electrons}",
+            f"    Scaled PSF integral: {self._lpsf_num(curve_meta.get('scaled_integral', 0.0))}",
+            "",
+            "#   Data Section  ----------------------------------------------",
+        ])
+        return comments
+
+    def _lpsf_num(self, value):
+        try:
+            val = float(value)
+        except Exception:
+            return "0"
+        if not math.isfinite(val):
+            return "0"
+        if abs(val) < 1e-300:
+            return "0"
+        return f"{val:.17g}"
 
     def get_material(self, name):
         for m in self.materials:
