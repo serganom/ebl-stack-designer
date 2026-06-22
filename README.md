@@ -31,6 +31,16 @@ In practical EBL work, PEC values are often obtained by combining commercial Mon
 
 The code keeps the model lightweight enough for interactive use while exposing diagnostics such as PSF normalization, fit residuals, fit window, export metadata, and warnings.
 
+## Screenshots
+
+Main stack-design and simulation interface:
+
+![EBL Stack Designer GUI](docs/images/gui-stack-example.png)
+
+PEC fit plot with measured Monte Carlo histogram, selected physical fit, and BEAMER Gaussian approximation:
+
+![PEC fit plot](docs/images/pec-fit-example.png)
+
 ## Current Highlights
 
 - custom material library with elemental composition, density, weight fraction, and atomic fraction
