@@ -2,7 +2,7 @@
 
 EBL Stack Designer is a desktop Python/Tkinter application for electron-beam lithography stack design, approximate Monte Carlo-style electron transport, radial PSF extraction, and BEAMER-compatible proximity effect correction parameter generation.
 
-Author: `made by Sergei Nomoev`
+Author: `Sergei Nomoev`
 
 Suggested GitHub repository description:
 
@@ -242,22 +242,3 @@ The fit pipeline currently includes:
 - early PEC parameter estimation
 - generating starting values for more detailed calibration
 - teaching / demonstration of EBL scattering and PEC behavior
-
-## Publishing To GitHub
-
-This local repository is intended to be published at:
-
-`git@github.com:serganom/ebl-stack-designer.git`
-
-If the remote is already configured:
-
-```bash
-git push
-```
-
-For a new clone or a newly initialized repository:
-
-```bash
-git remote add origin <YOUR_GITHUB_REPO_URL>
-git push -u origin main
-```
