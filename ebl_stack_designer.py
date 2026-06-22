@@ -2374,7 +2374,8 @@ class StackDesignerApp:
             raise ValueError("No energy in histogram.")
         ev = evals / total_e
         ring_area = np.pi * rvals**2 - np.concatenate(([0.0], np.pi * rvals[:-1]**2))
-        ed = ev / ring_area
+        ed = np.zeros_like(ev, dtype=float)
+        np.divide(ev, ring_area, out=ed, where=ring_area > 0)
         fit_window = self._prepare_fit_window(
             rvals,
             ev,
