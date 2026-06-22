@@ -2,6 +2,31 @@
 
 This document summarizes the physics approximations used in `ebl_stack_designer.py`.
 
+## 0. Units And PSF Normalization
+
+The program uses a strict unit policy:
+
+- internal lengths: `nm`
+- BEAMER-facing output lengths: `um`
+- density: `g/cm^3`
+- beam energy in the GUI: `keV`
+- layer thickness: `nm`
+- radial PSF density: `1/nm^2` internally and `1/um^2` in text/CSV export where stated
+
+Raw Monte Carlo deposited energy is accumulated in radial ring bins. It is converted to an area-density PSF by:
+
+`PSF_i = E_i / area_i`
+
+with:
+
+`area_i = pi * (r_outer^2 - r_inner^2)`
+
+The normalized physical PSF is expected to satisfy:
+
+`sum(PSF_i * area_i) ~= 1`
+
+The code stores and exports diagnostics for this integral and refuses export when a stored normalized PSF is clearly invalid.
+
 ## 1. Material Model
 
 Each material is defined by:
@@ -74,9 +99,13 @@ Standard PEC fit:
 
 where
 
-`G(sigma) = exp(-r^2 / sigma^2)`
+`G(width) = exp(-r^2 / width^2)`
 
 with normalization applied numerically over the sampled radial bins.
+
+This is the width convention used by the program and BEAMER-oriented output metadata. With this convention:
+
+`FWHM = 2 * width * sqrt(ln 2)`
 
 This is the conventional EBL PEC representation used in many older and current workflows.
 
@@ -122,6 +151,8 @@ The fitted radial PSF curve can be exported in three forms:
 - `.csv`: diagnostic table with measured histogram, selected physical fit, and BEAMER Gaussian approximation
 
 For `.lpsf`, the selected physical fit curve is resampled onto an exponential radial grid with 50 points per decade, similar to common mcTrace/BEAMER PSF archives. The amplitude is scaled as a relative PSF; the important quantity for PEC import is the radial shape, while BEAMER can normalize the numerical PSF internally.
+
+Exports are written atomically: the program writes a temporary file, reads it back, validates the curve, and only then replaces the target file.
 
 ## 10. Scope
 

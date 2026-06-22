@@ -1,4 +1,7 @@
 import json
+import os
+import tempfile
+import hashlib
 import math
 import time
 import random
@@ -6,9 +9,39 @@ import sys
 import zlib
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape as xml_escape
 np = None
 plt = None
+
+PROGRAM_NAME = "EBL Stack Designer"
+PROGRAM_VERSION = "0.4.0"
+PROGRAM_CREATOR = "Sergei Nomoev"
+PROJECT_SCHEMA_VERSION = 2
+INTERNAL_LENGTH_UNIT = "nm"
+BEAMER_LENGTH_UNIT = "um"
+GAUSSIAN_CONVENTION = "G(r,w)=exp(-r^2/w^2), normalized numerically over sampled radial bins"
+GAUSSIAN_FWHM_FACTOR = 2.0 * math.sqrt(math.log(2.0))
+
+
+def nm_to_um(value):
+    return float(value) * 1.0e-3
+
+
+def um_to_nm(value):
+    return float(value) * 1.0e3
+
+
+def nm_to_cm(value):
+    return float(value) * 1.0e-7
+
+
+def kev_to_ev(value):
+    return float(value) * 1.0e3
+
+
+def ev_to_kev(value):
+    return float(value) * 1.0e-3
 
 
 def _dependency_install_command():
@@ -56,6 +89,43 @@ def _norm(vals):
     if s <= 0:
         return list(vals)
     return [float(v) / s for v in vals]
+
+
+def _stable_json_hash(value):
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _radial_ring_area_nm2(r_nm):
+    _ensure_numpy()
+    r = np.asarray(r_nm, dtype=float)
+    if r.ndim != 1:
+        raise ValueError("Radius array must be one-dimensional.")
+    if r.size == 0:
+        return np.asarray([], dtype=float)
+    edges_inner = np.concatenate(([0.0], r[:-1]))
+    area = math.pi * (r ** 2 - edges_inner ** 2)
+    return np.where(np.isfinite(area) & (area > 0.0), area, 0.0)
+
+
+def _density_integral(density, ring_area):
+    _ensure_numpy()
+    y = np.asarray(density, dtype=float)
+    area = np.asarray(ring_area, dtype=float)
+    if y.size == 0 or y.size != area.size:
+        return float("nan")
+    mask = np.isfinite(y) & np.isfinite(area) & (y >= 0.0) & (area > 0.0)
+    return float(np.sum(y[mask] * area[mask]))
+
+
+def _cumulative_from_density(density, ring_area):
+    _ensure_numpy()
+    y = np.asarray(density, dtype=float)
+    area = np.asarray(ring_area, dtype=float)
+    if y.size == 0 or y.size != area.size:
+        return np.asarray([], dtype=float)
+    contrib = np.where(np.isfinite(y) & np.isfinite(area) & (y > 0.0) & (area > 0.0), y * area, 0.0)
+    return np.cumsum(contrib)
 
 
 def _mat(name, alias, density, elements, notes=""):
@@ -1404,6 +1474,12 @@ class StackDesignerApp:
             "current_pA": None if current_value is None else self._convert_current_value(current_value, current_unit, "pA"),
             "current_input_unit": current_unit,
         }
+        self.project["schema_version"] = PROJECT_SCHEMA_VERSION
+        self.project["program"] = {
+            "name": PROGRAM_NAME,
+            "version": PROGRAM_VERSION,
+            "creator": PROGRAM_CREATOR,
+        }
         if self.project["beam"]["energy_keV"] is None or self.project["beam"]["energy_keV"] <= 0:
             raise ValueError("Electron energy (keV) must be > 0.")
         self.project["materials"] = self.materials
@@ -1433,14 +1509,40 @@ class StackDesignerApp:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if "materials" not in data or "stack" not in data or "beam" not in data:
-                raise ValueError("Invalid project file.")
+            data, migration_warnings = self._migrate_project_data(data)
             self.project = data
             self.project_path = path
             self.refresh_all()
-            messagebox.showinfo("Loaded", f"Loaded project:\n{path}")
+            extra = "" if not migration_warnings else "\n\n" + "\n".join(migration_warnings)
+            messagebox.showinfo("Loaded", f"Loaded project:\n{path}{extra}")
         except Exception as exc:
             messagebox.showerror("Load Error", str(exc))
+
+    def _migrate_project_data(self, data):
+        if not isinstance(data, dict):
+            raise ValueError("Invalid project file.")
+        if "materials" not in data or "stack" not in data or "beam" not in data:
+            raise ValueError("Invalid project file.")
+        warnings = []
+        try:
+            schema_version = int(float(data.get("schema_version", 1) or 1))
+        except Exception:
+            schema_version = 1
+        if schema_version < 2:
+            warnings.append("Legacy JSON project detected: missing fields were filled with safe defaults.")
+            data.setdefault("pec_fits", [])
+        data["schema_version"] = PROJECT_SCHEMA_VERSION
+        data.setdefault("project_name", "Untitled")
+        data.setdefault("program", {
+            "name": PROGRAM_NAME,
+            "version": PROGRAM_VERSION,
+            "creator": PROGRAM_CREATOR,
+        })
+        beam = data.setdefault("beam", {})
+        beam.setdefault("beam_diameter_nm", None)
+        beam.setdefault("current_pA", None)
+        beam.setdefault("current_input_unit", "pA")
+        return data, warnings
 
     def export_summary(self):
         try:
@@ -1472,7 +1574,19 @@ class StackDesignerApp:
                 lines.append(f"beta (nm): {self.last_fit_result.get('beta_nm'):.4f}")
                 lines.append(f"eta (fit): {self.last_fit_result.get('eta_fit'):.6f}")
                 lines.append(f"eta (split): {self.last_fit_result.get('eta_split'):.6f}")
+                diag = self.last_fit_result.get("psf_diagnostics") or {}
+                fit_diag = self.last_fit_result.get("fit_diagnostics") or {}
+                if diag:
+                    lines.append(f"PSF integral: {float(diag.get('psf_integral', float('nan'))):.6f}")
+                    lines.append(f"Total deposited energy in selected resist: {float(diag.get('total_deposited_energy_keV', float('nan'))):.6g} keV")
+                if fit_diag:
+                    lines.append(f"Unweighted fit MSE (log10 density): {float(fit_diag.get('fit_unweighted_mse_log10', float('nan'))):.6g}")
                 lines.append(f"PEC guidance: {self.last_fit_result.get('pec_guidance', '')}")
+                warnings = self.last_fit_result.get("warnings") or []
+                if warnings:
+                    lines.append("Warnings:")
+                    for warning in warnings:
+                        lines.append(f"   - {warning}")
             fits = data.get("pec_fits", [])
             if fits:
                 lines.append("")
@@ -1569,42 +1683,86 @@ class StackDesignerApp:
 
     def _write_psf_two_column(self, path, fit_result):
         _ensure_numpy()
+        self._validate_export_source_curve(fit_result)
         plot_data = fit_result.get("plot_data") or {}
         r_nm = np.asarray(plot_data.get("r_nm", []), dtype=float)
         y_fit = np.asarray(plot_data.get("fitted_density", []), dtype=float)
         if r_nm.size == 0 or y_fit.size != r_nm.size:
             raise ValueError("Invalid PSF curve data.")
-        radius_um = r_nm / 1000.0
+        radius_um = r_nm * 1.0e-3
         density_per_um2 = y_fit * 1.0e6
         mask = np.isfinite(radius_um) & np.isfinite(density_per_um2) & (radius_um > 0) & (density_per_um2 > 0)
-        with open(path, "w", encoding="utf-8") as f:
-            for x_um, val in zip(radius_um[mask], density_per_um2[mask]):
-                f.write(f"{x_um:.9g} {val:.12e}\n")
+        lines = [
+            f"{x_um:.9g} {val:.12e}"
+            for x_um, val in zip(radius_um[mask], density_per_um2[mask])
+        ]
+        self._atomic_write_text(path, "\n".join(lines) + "\n", self._validate_psf_two_column_file)
 
     def _write_psf_csv(self, path, fit_result):
         _ensure_numpy()
+        self._validate_export_source_curve(fit_result)
         plot_data = fit_result.get("plot_data") or {}
         r_nm = np.asarray(plot_data.get("r_nm", []), dtype=float)
         y_meas = np.asarray(plot_data.get("measured_density", []), dtype=float)
         y_fit = np.asarray(plot_data.get("fitted_density", []), dtype=float)
         y_beamer = np.asarray(plot_data.get("beamer_gaussian_density", []), dtype=float)
+        log_resid = np.asarray(plot_data.get("log10_residual", []), dtype=float)
         if r_nm.size == 0 or y_fit.size != r_nm.size:
             raise ValueError("Invalid PSF curve data.")
         if y_meas.size != r_nm.size:
             y_meas = np.full_like(r_nm, float("nan"))
         if y_beamer.size != r_nm.size:
             y_beamer = np.full_like(r_nm, float("nan"))
-        radius_um = r_nm / 1000.0
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("# EBL Stack Designer PSF export\n")
-            f.write("# made by Sergei Nomoev\n")
-            f.write(f"# model,{self._fit_model_display_name(fit_result)}\n")
-            f.write("# density columns are converted from 1/nm^2 to 1/um^2\n")
-            f.write("radius_um,measured_density_per_um2,selected_fit_density_per_um2,beamer_gaussian_density_per_um2\n")
-            for row in zip(radius_um, y_meas * 1.0e6, y_fit * 1.0e6, y_beamer * 1.0e6):
-                f.write(",".join(f"{float(v):.12e}" for v in row) + "\n")
+        if log_resid.size != r_nm.size:
+            log_resid = np.full_like(r_nm, float("nan"))
+        radius_um = r_nm * 1.0e-3
+        area = _radial_ring_area_nm2(r_nm)
+        cumulative_meas = _cumulative_from_density(y_meas, area)
+        cumulative_fit = _cumulative_from_density(y_fit, area)
+        metadata = self._export_metadata(fit_result)
+        lines = [
+            "# EBL Stack Designer PSF export",
+            f"# program_name,{metadata['program_name']}",
+            f"# program_version,{metadata['program_version']}",
+            f"# creator,{metadata['creator']}",
+            f"# export_time,{metadata['export_time']}",
+            f"# python_version,{metadata['python_version']}",
+            f"# schema_version,{metadata['schema_version']}",
+            f"# stack_hash,{metadata['stack_hash']}",
+            f"# material_library_hash,{metadata['material_library_hash']}",
+            f"# beam_energy_keV,{metadata['beam_energy_keV']}",
+            f"# number_of_electrons,{metadata['number_of_electrons']}",
+            f"# random_seed,{metadata['random_seed']}",
+            f"# selected_resist_layers,{metadata['selected_resist_layers']}",
+            f"# model,{self._fit_model_display_name(fit_result)}",
+            f"# gaussian_convention,{GAUSSIAN_CONVENTION}",
+            f"# internal_length_unit,{INTERNAL_LENGTH_UNIT}",
+            f"# beamer_length_unit,{BEAMER_LENGTH_UNIT}",
+            f"# psf_normalization,{metadata['psf_normalization']}",
+            f"# psf_integral,{metadata['psf_integral']}",
+            f"# short_range_parameter_nm,{metadata['short_range_parameter_nm']}",
+            f"# short_range_fwhm_nm,{metadata['short_range_fwhm_nm']}",
+            f"# short_range_fwhm_um,{metadata['short_range_fwhm_um']}",
+            f"# fit_weighted_mse_log10,{metadata['fit_weighted_mse_log10']}",
+            f"# fit_unweighted_mse_log10,{metadata['fit_unweighted_mse_log10']}",
+            f"# warnings,{metadata['warnings']}",
+            "# density columns are converted from 1/nm^2 to 1/um^2",
+            "radius_um,measured_density_per_um2,selected_fit_density_per_um2,beamer_gaussian_density_per_um2,cumulative_measured,cumulative_selected_fit,log10_residual_selected_minus_measured",
+        ]
+        for row in zip(
+            radius_um,
+            y_meas * 1.0e6,
+            y_fit * 1.0e6,
+            y_beamer * 1.0e6,
+            cumulative_meas,
+            cumulative_fit,
+            log_resid,
+        ):
+            lines.append(",".join(f"{float(v):.12e}" for v in row))
+        self._atomic_write_text(path, "\n".join(lines) + "\n", self._validate_psf_csv_file)
 
     def _write_lpsf_archive(self, path, fit_result):
+        self._validate_export_source_curve(fit_result)
         points, curve_meta = self._build_lpsf_curve_points(fit_result)
         stack = fit_result.get("stack_snapshot") or self.project.get("stack", [])
         stack = [dict(layer) for layer in stack]
@@ -1636,6 +1794,7 @@ class StackDesignerApp:
         z_position_um = max(0.0, resist_thickness_nm / 2000.0)
         mesh_z_size_nm = 10.0
         mesh_z_count = max(1, int(math.ceil(resist_thickness_nm / mesh_z_size_nm)) + 1) if resist_thickness_nm > 0 else 1
+        metadata = self._export_metadata(fit_result)
 
         comments = self._lpsf_comment_lines(
             stack=stack,
@@ -1648,6 +1807,7 @@ class StackDesignerApp:
             electrons=electrons,
             curve_meta=curve_meta,
             fit_result=fit_result,
+            metadata=metadata,
         )
 
         lines = [
@@ -1712,8 +1872,174 @@ class StackDesignerApp:
         ])
 
         xml_text = "\n".join(lines)
-        with open(path, "wb") as f:
-            f.write(zlib.compress(xml_text.encode("utf-8"), level=6))
+        payload = zlib.compress(xml_text.encode("utf-8"), level=6)
+        self._atomic_write_bytes(path, payload, self._validate_lpsf_file)
+
+    def _validate_export_source_curve(self, fit_result):
+        _ensure_numpy()
+        plot_data = fit_result.get("plot_data") or {}
+        r_nm = np.asarray(plot_data.get("r_nm", []), dtype=float)
+        y_fit = np.asarray(plot_data.get("fitted_density", []), dtype=float)
+        if r_nm.size == 0 or y_fit.size != r_nm.size:
+            raise ValueError("No valid selected physical fit curve is available for export.")
+        mask = np.isfinite(r_nm) & np.isfinite(y_fit) & (r_nm > 0.0) & (y_fit > 0.0)
+        if np.count_nonzero(mask) < 10:
+            raise ValueError("Export PSF curve has too few positive finite points.")
+        psf_diag = fit_result.get("psf_diagnostics") or {}
+        psf_integral = psf_diag.get("psf_integral")
+        if psf_integral is not None:
+            psf_integral = float(psf_integral)
+            if not math.isfinite(psf_integral) or abs(psf_integral - 1.0) > 0.05:
+                raise ValueError(f"Refusing export: normalized PSF integral is {psf_integral:.6g}, expected approximately 1.")
+
+    def _export_metadata(self, fit_result):
+        stack = fit_result.get("stack_snapshot") or self.project.get("stack", [])
+        materials = self.project.get("materials", self.materials if hasattr(self, "materials") else [])
+        sim = fit_result.get("simulation") or {}
+        psf_diag = fit_result.get("psf_diagnostics") or {}
+        fit_diag = fit_result.get("fit_diagnostics") or {}
+        selected_layers = sim.get("resist_layer_indices")
+        if selected_layers is None:
+            selected_layers = [sim.get("resist_layer_index")] if sim.get("resist_layer_index") is not None else []
+        try:
+            fwhm_um = float(fit_result.get("beamer_fwhm_um", sim.get("beamer_fwhm_um", 0.03)) or 0.0)
+        except Exception:
+            fwhm_um = 0.0
+        short_range_parameter_um = fwhm_um / GAUSSIAN_FWHM_FACTOR if fwhm_um > 0.0 else 0.0
+        return {
+            "program_name": PROGRAM_NAME,
+            "program_version": PROGRAM_VERSION,
+            "creator": PROGRAM_CREATOR,
+            "export_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "python_version": sys.version.split()[0],
+            "schema_version": PROJECT_SCHEMA_VERSION,
+            "stack_hash": _stable_json_hash(stack),
+            "material_library_hash": _stable_json_hash(materials),
+            "beam_energy_keV": fit_result.get("beam_energy_keV", sim.get("beam_energy_keV")),
+            "number_of_electrons": sim.get("electrons"),
+            "random_seed": sim.get("seed"),
+            "selected_resist_layers": selected_layers,
+            "internal_length_unit": INTERNAL_LENGTH_UNIT,
+            "beamer_output_length_unit": BEAMER_LENGTH_UNIT,
+            "psf_normalization": psf_diag.get("normalization", "area_density_integral_1"),
+            "psf_integral": psf_diag.get("psf_integral"),
+            "gaussian_convention": GAUSSIAN_CONVENTION,
+            "short_range_parameter_nm": um_to_nm(short_range_parameter_um),
+            "short_range_fwhm_nm": um_to_nm(fwhm_um),
+            "short_range_fwhm_um": fwhm_um,
+            "fit_model": self._fit_model_display_name(fit_result),
+            "fit_weighted_mse_log10": fit_result.get("fit_mse"),
+            "fit_unweighted_mse_log10": fit_diag.get("fit_unweighted_mse_log10"),
+            "warnings": fit_result.get("warnings") or [],
+        }
+
+    def _atomic_write_text(self, path, text, validator):
+        directory = os.path.dirname(os.path.abspath(path)) or "."
+        fd, tmp_path = tempfile.mkstemp(prefix=".ebl_export_", suffix=".tmp", dir=directory, text=True)
+        os.close(fd)
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(text)
+            validator(tmp_path)
+            os.replace(tmp_path, path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    def _atomic_write_bytes(self, path, payload, validator):
+        directory = os.path.dirname(os.path.abspath(path)) or "."
+        fd, tmp_path = tempfile.mkstemp(prefix=".ebl_export_", suffix=".tmp", dir=directory)
+        os.close(fd)
+        try:
+            with open(tmp_path, "wb") as f:
+                f.write(payload)
+            validator(tmp_path)
+            os.replace(tmp_path, path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    def _validate_psf_two_column_file(self, path):
+        count = 0
+        last_r = -1.0
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                parts = stripped.split()
+                if len(parts) != 2:
+                    raise ValueError("PSF text export validation failed: expected two columns.")
+                r_um, value = float(parts[0]), float(parts[1])
+                if not (math.isfinite(r_um) and math.isfinite(value) and r_um > 0.0 and value > 0.0):
+                    raise ValueError("PSF text export validation failed: non-positive or non-finite value.")
+                if r_um <= last_r:
+                    raise ValueError("PSF text export validation failed: radii are not strictly increasing.")
+                last_r = r_um
+                count += 1
+        if count < 10:
+            raise ValueError("PSF text export validation failed: too few points.")
+
+    def _validate_psf_csv_file(self, path):
+        required = {
+            "radius_um",
+            "measured_density_per_um2",
+            "selected_fit_density_per_um2",
+            "beamer_gaussian_density_per_um2",
+            "cumulative_measured",
+            "cumulative_selected_fit",
+            "log10_residual_selected_minus_measured",
+        }
+        header = None
+        count = 0
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("#") or not line.strip():
+                    continue
+                header = [part.strip() for part in line.strip().split(",")]
+                break
+            if header is None or not required.issubset(set(header)):
+                raise ValueError("CSV export validation failed: required columns are missing.")
+            for line in f:
+                if not line.strip():
+                    continue
+                parts = line.strip().split(",")
+                if len(parts) != len(header):
+                    raise ValueError("CSV export validation failed: row length mismatch.")
+                values = [float(v) for v in parts]
+                if not all(math.isfinite(v) or math.isnan(v) for v in values):
+                    raise ValueError("CSV export validation failed: invalid numeric value.")
+                count += 1
+        if count < 10:
+            raise ValueError("CSV export validation failed: too few data rows.")
+
+    def _validate_lpsf_file(self, path):
+        with open(path, "rb") as f:
+            xml_text = zlib.decompress(f.read()).decode("utf-8")
+        root = ET.fromstring(xml_text)
+        data = root.find(".//m_PSFDataOriginal")
+        if data is None:
+            raise ValueError("LPSF export validation failed: missing m_PSFDataOriginal.")
+        count_node = data.find("count")
+        expected = int(count_node.text) if count_node is not None and count_node.text else 0
+        xs = []
+        ys = []
+        for item in data.findall("item"):
+            x_node = item.find("m_x")
+            y_node = item.find("m_y")
+            if x_node is None or y_node is None:
+                raise ValueError("LPSF export validation failed: malformed point.")
+            xs.append(float(x_node.text))
+            ys.append(float(y_node.text))
+        if expected != len(xs) or len(xs) < 10:
+            raise ValueError("LPSF export validation failed: point count mismatch.")
+        for i, (x_val, y_val) in enumerate(zip(xs, ys)):
+            if not (math.isfinite(x_val) and math.isfinite(y_val)):
+                raise ValueError("LPSF export validation failed: non-finite point.")
+            if x_val < 0.0 or y_val < 0.0:
+                raise ValueError("LPSF export validation failed: negative point.")
+            if i > 0 and x_val <= xs[i - 1]:
+                raise ValueError("LPSF export validation failed: radii are not strictly increasing.")
 
     def _build_lpsf_curve_points(self, fit_result):
         _ensure_numpy()
@@ -1793,12 +2119,19 @@ class StackDesignerApp:
         electrons,
         curve_meta,
         fit_result,
+        metadata=None,
     ):
+        metadata = metadata or self._export_metadata(fit_result)
         now_txt = time.strftime("%Y-%b-%d %H:%M:%S")
         comments = [
             f"## PSF ARCHIVED on {now_txt}",
             "   EBL Stack Designer standalone export",
             "   made by Sergei Nomoev",
+            f"   ProgramVersion: {metadata.get('program_version')}",
+            f"   PythonVersion: {metadata.get('python_version')}",
+            f"   SchemaVersion: {metadata.get('schema_version')}",
+            f"   StackHash: {metadata.get('stack_hash')}",
+            f"   MaterialLibraryHash: {metadata.get('material_library_hash')}",
             "#   Data Management  -------------------------------------------",
             "",
             "    RadialMode:                                      exponential",
@@ -1809,6 +2142,10 @@ class StackDesignerApp:
             f"    MeshRZSpD:       {int(curve_meta.get('points_per_decade', 50))}",
             f"    MeshRZSizeZ/nm:  {self._lpsf_num(mesh_z_size_nm)}",
             f"    ExportScale:     {self._lpsf_num(curve_meta.get('scale', 0.0))}",
+            f"    InternalLengthUnit: {INTERNAL_LENGTH_UNIT}",
+            f"    BeamerLengthUnit:   {BEAMER_LENGTH_UNIT}",
+            f"    PSFNormalization:   {metadata.get('psf_normalization')}",
+            f"    PSFIntegral:        {self._lpsf_num(metadata.get('psf_integral', 0.0))}",
             "#",
             "#   Material Stack  --------------------------------------------",
             "",
@@ -1834,21 +2171,30 @@ class StackDesignerApp:
             f"    Injection Energy/eV:          {self._lpsf_num(float(energy_keV) * 1000.0)}",
             f"    Gaussian Injection Radius/nm: {self._lpsf_num(injection_radius_nm)}",
             f"    SE Cutoff Energy/eV:          {self._lpsf_num(min_energy_eV)}",
+            f"    Random Seed:                  {metadata.get('random_seed')}",
+            f"    Selected Resist Layers:       {metadata.get('selected_resist_layers')}",
             "    Simulator:                    EBL Stack Designer standalone_mc",
             "#",
             "#   PEC Fit  ----------------------------------------------------",
             "",
             f"    FitModel:                     {self._fit_model_display_name(fit_result)}",
             f"    LayerPattern:                 {fit_result.get('layer_pattern', '')}",
+            f"    GaussianConvention:           {GAUSSIAN_CONVENTION}",
             f"    Beta/nm:                      {self._lpsf_num(fit_result.get('beta_nm', 0.0))}",
             f"    Eta:                          {self._lpsf_num(fit_result.get('eta_fit', 0.0))}",
             f"    FitWindowMax/nm:              {self._lpsf_num(fit_result.get('fit_window_max_nm', 0.0))}",
+            f"    FitWeightedMSELog10:          {self._lpsf_num(metadata.get('fit_weighted_mse_log10', 0.0))}",
+            f"    FitUnweightedMSELog10:        {self._lpsf_num(metadata.get('fit_unweighted_mse_log10', 0.0))}",
+            f"    ShortRangeParameter/nm:       {self._lpsf_num(metadata.get('short_range_parameter_nm', 0.0))}",
+            f"    ShortRangeFWHM/nm:            {self._lpsf_num(metadata.get('short_range_fwhm_nm', 0.0))}",
+            f"    ShortRangeFWHM/um:            {self._lpsf_num(metadata.get('short_range_fwhm_um', 0.0))}",
             "#",
             "#   Simulation Status & Statistics  ----------------------------",
             "",
             "    Traced Electrons",
             f"      - primary:  {electrons}",
             f"    Scaled PSF integral: {self._lpsf_num(curve_meta.get('scaled_integral', 0.0))}",
+            f"    Warnings: {metadata.get('warnings')}",
             "",
             "#   Data Section  ----------------------------------------------",
         ])
@@ -2348,6 +2694,141 @@ class StackDesignerApp:
             "beam_sigma_nm": float(beam_sigma_nm),
         }
 
+    def _histogram_psf_diagnostics(self, rvals_nm, evals, ring_area_nm2, psf_density):
+        _ensure_numpy()
+        r = np.asarray(rvals_nm, dtype=float)
+        e = np.asarray(evals, dtype=float)
+        area = np.asarray(ring_area_nm2, dtype=float)
+        density = np.asarray(psf_density, dtype=float)
+        finite_density = np.isfinite(density)
+        nonzero = (e > 0.0) & np.isfinite(e)
+        integral = _density_integral(density, area)
+        cumulative = _cumulative_from_density(density, area)
+        warnings = []
+        if not np.all(np.isfinite(e)):
+            warnings.append("Raw histogram contains NaN/inf values.")
+        if np.any(e < 0.0):
+            warnings.append("Raw histogram contains negative energy bins.")
+        if not np.all(finite_density):
+            warnings.append("Normalized PSF contains NaN/inf values.")
+        if np.any(density[finite_density] < 0.0):
+            warnings.append("Normalized PSF contains negative values.")
+        if not math.isfinite(integral) or abs(integral - 1.0) > 5.0e-3:
+            warnings.append(f"Normalized PSF integral is {integral:.6g}, expected approximately 1.")
+        return {
+            "normalization": "area_density_integral_1",
+            "internal_length_unit": INTERNAL_LENGTH_UNIT,
+            "density_unit": "1/nm^2",
+            "total_deposited_energy_keV": float(np.sum(e[np.isfinite(e)])),
+            "psf_integral": integral,
+            "cumulative_energy_r_max": float(cumulative[-1]) if cumulative.size else float("nan"),
+            "r_max_nm": float(r[-1]) if r.size else float("nan"),
+            "radial_bin_count": int(r.size),
+            "nonzero_bin_count": int(np.count_nonzero(nonzero)),
+            "warnings": warnings,
+        }
+
+    def _fit_curve_diagnostics(self, r_nm, measured_density, fitted_density, weights=None, ring_area_nm2=None):
+        _ensure_numpy()
+        r = np.asarray(r_nm, dtype=float)
+        measured = np.asarray(measured_density, dtype=float)
+        fitted = np.asarray(fitted_density, dtype=float)
+        if r.size == 0 or measured.size != r.size or fitted.size != r.size:
+            return {
+                "fit_unweighted_mse_log10": float("nan"),
+                "fit_max_abs_log10_residual": float("nan"),
+                "selected_fit_integral_window": float("nan"),
+                "measured_integral_window": float("nan"),
+                "warnings": ["Fit curve diagnostics could not be computed."],
+            }
+        if ring_area_nm2 is None:
+            area = _radial_ring_area_nm2(r)
+        else:
+            area = np.asarray(ring_area_nm2, dtype=float)
+            if area.size != r.size:
+                area = _radial_ring_area_nm2(r)
+        mask = (
+            np.isfinite(measured)
+            & np.isfinite(fitted)
+            & (measured > 0.0)
+            & (fitted > 0.0)
+        )
+        warnings = []
+        if np.count_nonzero(mask) < max(10, int(0.1 * r.size)):
+            warnings.append("Too few positive finite bins for robust residual diagnostics.")
+        log_resid = np.zeros_like(r, dtype=float)
+        if np.any(mask):
+            log_resid[mask] = np.log10(fitted[mask]) - np.log10(measured[mask])
+        unweighted = float(np.mean(log_resid[mask] ** 2)) if np.any(mask) else float("nan")
+        if weights is not None:
+            w = np.asarray(weights, dtype=float)
+            if w.size == r.size and np.any(mask):
+                w_mask = np.clip(w[mask], 0.0, None)
+                weighted = float(np.sum(w_mask * log_resid[mask] ** 2) / max(float(np.sum(w_mask)), 1e-300))
+            else:
+                weighted = float("nan")
+        else:
+            weighted = float("nan")
+        selected_integral = _density_integral(fitted, area)
+        measured_integral = _density_integral(measured, area)
+        if not math.isfinite(selected_integral) or selected_integral <= 0.0:
+            warnings.append("Selected physical fit integral is invalid in the fit window.")
+        if np.any(fitted[np.isfinite(fitted)] < 0.0):
+            warnings.append("Selected physical fit contains negative values.")
+        return {
+            "fit_unweighted_mse_log10": unweighted,
+            "fit_weighted_mse_log10_check": weighted,
+            "fit_max_abs_log10_residual": float(np.max(np.abs(log_resid[mask]))) if np.any(mask) else float("nan"),
+            "selected_fit_integral_window": selected_integral,
+            "measured_integral_window": measured_integral,
+            "log10_residual": log_resid.tolist(),
+            "warnings": warnings,
+        }
+
+    def _fit_parameter_warnings(self, physical_fit, beamer_fit):
+        warnings = []
+
+        def finite_positive(name, value, allow_zero=False):
+            try:
+                val = float(value)
+            except Exception:
+                warnings.append(f"{name} is not numeric.")
+                return float("nan")
+            if not math.isfinite(val):
+                warnings.append(f"{name} is not finite.")
+            elif val < 0.0 or (val == 0.0 and not allow_zero):
+                warnings.append(f"{name} must be positive.")
+            return val
+
+        beta = finite_positive("Physical beta_nm", physical_fit.get("beta_nm"))
+        eta = finite_positive("Physical eta", physical_fit.get("eta_fit"), allow_zero=True)
+        if str(physical_fit.get("fit_model", "")) == "double_gaussian":
+            alpha = finite_positive("Physical alpha_nm", physical_fit.get("alpha_nm"))
+            if math.isfinite(alpha) and math.isfinite(beta) and beta <= alpha:
+                warnings.append("Physical double-Gaussian beta is not larger than alpha.")
+        elif str(physical_fit.get("fit_model", "")) == "power_gaussian":
+            finite_positive("Physical alpha_power", physical_fit.get("alpha_power"))
+        if math.isfinite(eta) and eta > 50.0:
+            warnings.append("Physical eta is very large; PEC fit may be boundary/noise dominated.")
+
+        alpha_b = finite_positive("BEAMER alpha_nm", beamer_fit.get("alpha_nm"))
+        gamma1 = finite_positive("BEAMER gamma1_nm", beamer_fit.get("gamma1_nm"), allow_zero=True)
+        gamma2 = finite_positive("BEAMER gamma2_nm", beamer_fit.get("gamma2_nm"), allow_zero=True)
+        beta_b = finite_positive("BEAMER beta_nm", beamer_fit.get("beta_nm"))
+        finite_positive("BEAMER eta", beamer_fit.get("eta_fit"), allow_zero=True)
+        finite_positive("BEAMER nue1", beamer_fit.get("nue1"), allow_zero=True)
+        finite_positive("BEAMER nue2", beamer_fit.get("nue2"), allow_zero=True)
+        if math.isfinite(alpha_b) and math.isfinite(gamma1) and gamma1 > 0.0 and gamma1 <= alpha_b:
+            warnings.append("BEAMER gamma1 is not larger than alpha.")
+        if math.isfinite(gamma2) and gamma2 > 0.0:
+            if math.isfinite(gamma1) and gamma2 <= gamma1:
+                warnings.append("BEAMER gamma2 is not larger than gamma1.")
+            if math.isfinite(beta_b) and beta_b <= gamma2:
+                warnings.append("BEAMER beta is not larger than gamma2.")
+        elif math.isfinite(gamma1) and gamma1 > 0.0 and math.isfinite(beta_b) and beta_b <= gamma1:
+            warnings.append("BEAMER beta is not larger than gamma1.")
+        return warnings
+
     def _fit_alpha_beta_eta_from_histogram(
         self,
         rvals,
@@ -2373,9 +2854,14 @@ class StackDesignerApp:
         if total_e <= 0:
             raise ValueError("No energy in histogram.")
         ev = evals / total_e
-        ring_area = np.pi * rvals**2 - np.concatenate(([0.0], np.pi * rvals[:-1]**2))
+        ring_area = _radial_ring_area_nm2(rvals)
         ed = np.zeros_like(ev, dtype=float)
         np.divide(ev, ring_area, out=ed, where=ring_area > 0)
+        psf_diagnostics = self._histogram_psf_diagnostics(rvals, evals, ring_area, ed)
+        if psf_diagnostics["warnings"]:
+            severe = [w for w in psf_diagnostics["warnings"] if "integral" in w or "negative" in w or "NaN/inf" in w]
+            if severe:
+                raise ValueError("Invalid normalized PSF: " + "; ".join(severe))
         fit_window = self._prepare_fit_window(
             rvals,
             ev,
@@ -2428,6 +2914,18 @@ class StackDesignerApp:
         else:
             best = best_pg if best_pg["mse"] < best_dg["mse"] * 0.90 else best_dg
 
+        fit_diag = self._fit_curve_diagnostics(
+            best["plot_r_nm"],
+            best["plot_measured_density"],
+            best["plot_fitted_density"],
+            weights=fit_weights,
+            ring_area_nm2=fit_ring_area,
+        )
+        warnings = []
+        warnings.extend(psf_diagnostics.get("warnings", []))
+        warnings.extend(fit_diag.get("warnings", []))
+        warnings.extend(self._fit_parameter_warnings(best, beamer_fit))
+
         dr = 1.0
         fwd_idx = int(max(1, min(len(ev) - 2, round(float(forward_nm) / dr))))
         fwd = float(ev[1:fwd_idx + 1].sum())
@@ -2445,12 +2943,18 @@ class StackDesignerApp:
             "eta_fit": best["eta_fit"],
             "eta_split": eta_split,
             "fit_mse": best["mse"],
+            "fit_unweighted_mse_log10": fit_diag["fit_unweighted_mse_log10"],
+            "fit_max_abs_log10_residual": fit_diag["fit_max_abs_log10_residual"],
             "plot_data": {
                 "r_nm": best["plot_r_nm"],
                 "measured_density": best["plot_measured_density"],
                 "fitted_density": best["plot_fitted_density"],
                 "beamer_gaussian_density": beamer_plot_density.tolist(),
+                "log10_residual": fit_diag["log10_residual"],
             },
+            "psf_diagnostics": psf_diagnostics,
+            "fit_diagnostics": {k: v for k, v in fit_diag.items() if k not in ("log10_residual", "warnings")},
+            "warnings": warnings,
             "fit_candidates": {
                 "double_gaussian": {
                     "mse": best_dg["mse"],
@@ -2472,7 +2976,11 @@ class StackDesignerApp:
             "resist_material_name": resist_material_name,
             "fit_window_max_nm": fit_window["fit_window_max_nm"],
             "fit_point_count": fit_window["fit_point_count"],
+            "fit_excluded_bin_count": int(len(rvals) - fit_window["fit_point_count"]),
             "fit_weighting": fit_window["weighting_description"],
+            "gaussian_convention": GAUSSIAN_CONVENTION,
+            "internal_length_unit": INTERNAL_LENGTH_UNIT,
+            "beamer_length_unit": BEAMER_LENGTH_UNIT,
         }
         if best["fit_model"] == "power_gaussian":
             out["alpha_power"] = best["alpha_power"]
@@ -2690,6 +3198,24 @@ class StackDesignerApp:
 
     def _show_fit_result_dialog(self, res):
         beamer_txt = self._beamer_gaussian_text(res)
+        psf_diag = res.get("psf_diagnostics") or {}
+        fit_diag = res.get("fit_diagnostics") or {}
+        warnings = res.get("warnings") or []
+        diag_txt = ""
+        if psf_diag or fit_diag:
+            diag_txt = (
+                "\n\nPSF / Fit Diagnostics\n"
+                f"PSF integral: {float(psf_diag.get('psf_integral', float('nan'))):.6f}\n"
+                f"Cumulative energy at r_max: {float(psf_diag.get('cumulative_energy_r_max', float('nan'))):.6f}\n"
+                f"Total deposited energy in selected resist: {float(psf_diag.get('total_deposited_energy_keV', float('nan'))):.6g} keV\n"
+                f"Nonzero radial bins: {int(psf_diag.get('nonzero_bin_count', 0))}/{int(psf_diag.get('radial_bin_count', 0))}\n"
+                f"Excluded bins outside fit window: {int(res.get('fit_excluded_bin_count', 0))}\n"
+                f"Unweighted MSE (log10 density): {float(fit_diag.get('fit_unweighted_mse_log10', float('nan'))):.6g}\n"
+                f"Max |log10 residual|: {float(fit_diag.get('fit_max_abs_log10_residual', float('nan'))):.6g}"
+            )
+        warning_txt = ""
+        if warnings:
+            warning_txt = "\n\nWarnings\n" + "\n".join(f"- {w}" for w in warnings)
         msg = (
             "PEC fit complete\n\n"
             f"Model: {self._fit_model_display_name(res)}\n"
@@ -2706,7 +3232,9 @@ class StackDesignerApp:
             f"Fit weighting: {res.get('fit_weighting', '')}\n"
             f"Fit MSE (log10 density): {res['fit_mse']:.6g}\n"
             f"PEC guidance: {res.get('pec_guidance', '')}"
+            f"{diag_txt}"
             f"{beamer_txt}"
+            f"{warning_txt}"
         )
         self._show_text_dialog("PEC Fit Result", msg, width=720, height=420)
 
@@ -2716,19 +3244,21 @@ class StackDesignerApp:
         if not beamer and not dg:
             return ""
         src = beamer or dg
-        alpha_um = float(src.get("alpha_nm", float("nan"))) / 1000.0
-        beta_um = float(src.get("beta_nm", float("nan"))) / 1000.0
+        alpha_um = nm_to_um(src.get("alpha_nm", float("nan")))
+        beta_um = nm_to_um(src.get("beta_nm", float("nan")))
         eta = float(src.get("eta_fit", float("nan")))
-        gamma1_um = float(src.get("gamma1_nm", 0.0) or 0.0) / 1000.0
+        gamma1_um = nm_to_um(src.get("gamma1_nm", 0.0) or 0.0)
         nue1 = float(src.get("nue1", 0.0) or 0.0)
-        gamma2_um = float(src.get("gamma2_nm", 0.0) or 0.0) / 1000.0
+        gamma2_um = nm_to_um(src.get("gamma2_nm", 0.0) or 0.0)
         nue2 = float(src.get("nue2", 0.0) or 0.0)
         try:
             fwhm_um = float(res.get("beamer_fwhm_um", 0.03))
         except Exception:
             fwhm_um = 0.03
+        short_range_param_um = fwhm_um / GAUSSIAN_FWHM_FACTOR if fwhm_um > 0 else 0.0
         return (
             "\n\nBEAMER Gaussian Approximation (um)\n"
+            f"Gaussian convention: {GAUSSIAN_CONVENTION}\n"
             f"Alpha [um]: {alpha_um:.6f}\n"
             f"Beta [um]: {beta_um:.6f}\n"
             f"Eta: {eta:.6f}\n"
@@ -2737,6 +3267,7 @@ class StackDesignerApp:
             f"Gamma2 [um]: {gamma2_um:.6f}\n"
             f"Nue2: {nue2:.6f}\n"
             f"Effective short-range blur FWHM [um]: {fwhm_um:.6f}\n"
+            f"Equivalent short-range Gaussian parameter [um]: {short_range_param_um:.6f}\n"
             f"BEAMER Gaussian MSE: {float(src.get('mse', float('nan'))):.6g}\n"
             "Note: Alpha/Beta/Eta/Gamma1/Nue1 above are Gaussian-equivalent values for BEAMER. "
             "They are shown even when the selected physical fit is Power-Gaussian."
@@ -2754,10 +3285,10 @@ class StackDesignerApp:
             fwhm_um = 0.03
         return (
             "BEAMER values (um)\n"
-            f"Alpha={float(src.get('alpha_nm', float('nan'))) / 1000.0:.6f}\n"
-            f"Beta={float(src.get('beta_nm', float('nan'))) / 1000.0:.6f}\n"
+            f"Alpha={nm_to_um(src.get('alpha_nm', float('nan'))):.6f}\n"
+            f"Beta={nm_to_um(src.get('beta_nm', float('nan'))):.6f}\n"
             f"Eta={float(src.get('eta_fit', float('nan'))):.6f}\n"
-            f"Gamma1={float(src.get('gamma1_nm', 0.0) or 0.0) / 1000.0:.6f}\n"
+            f"Gamma1={nm_to_um(src.get('gamma1_nm', 0.0) or 0.0):.6f}\n"
             f"Nue1={float(src.get('nue1', 0.0) or 0.0):.6f}\n"
             f"FWHM={fwhm_um:.6f}"
         )

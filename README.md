@@ -39,6 +39,8 @@ It is not meant to replace a fully calibrated production simulator.
 - BEAMER-ready micrometer parameters shown directly on the PEC fit plot
 - optional BEAMER Gaussian approximation curve shown on the same PEC plot as the selected physical fit
 - PSF curve export as BEAMER-compatible compressed `.lpsf`, simple two-column `.psf`, or full diagnostic `.csv`
+- PSF normalization diagnostics, fit residual metrics, export metadata, and export roundtrip validation
+- legacy JSON migration with `schema_version`
 - fit plot viewer
 - live Monte Carlo progress window with:
   - electron count
@@ -149,6 +151,14 @@ If dependencies are missing for that interpreter:
 ```
 
 The bundled launchers try to prefer a Python interpreter with working `tkinter`.
+
+## Smoke Test
+
+Run the no-GUI engineering smoke test before publishing or after physics/export edits:
+
+```bash
+python3 tests/smoke_test.py
+```
 
 ## Basic Workflow
 
