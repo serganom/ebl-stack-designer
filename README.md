@@ -1,24 +1,35 @@
 # EBL Stack Designer
 
-Desktop Python/Tkinter application for electron-beam lithography stack design, fast standalone Monte Carlo style energy-deposition simulation, and PEC parameter fitting.
+EBL Stack Designer is a desktop Python/Tkinter application for electron-beam lithography stack design, approximate Monte Carlo-style electron transport, radial PSF extraction, and BEAMER-compatible proximity effect correction parameter generation.
 
 Author: `made by Sergei Nomoev`
 
-Suggested GitHub repo description:
-`Desktop EBL stack designer with standalone Monte Carlo PEC fitting, adaptive PSF models, and multilayer material/stack editing.`
+Suggested GitHub repository description:
+
+`Python GUI for EBL multilayer stack design, approximate Monte Carlo PSF simulation, and BEAMER-compatible PEC export.`
 
 ## What It Is
 
-`EBL Stack Designer` is a practical GUI tool for building multilayer EBL stacks and estimating proximity-effect parameters without requiring a full external Monte Carlo workflow for every iteration.
+`EBL Stack Designer` is a practical engineering GUI for building multilayer EBL stacks and estimating proximity-effect parameters without requiring a full external Monte Carlo workflow for every iteration.
+
+The program was developed to combine common day-to-day EBL PEC tasks into one lightweight workflow: stack definition, material bookkeeping, approximate electron transport, PSF fitting, BEAMER-style Gaussian parameters, and numerical PSF export.
 
 It is meant for:
 
 - rapid PEC exploration
 - comparing substrates, resists, and layer stacks
 - estimating `alpha`, `beta`, `eta`, or `alpha_p`
+- generating BEAMER Gaussian Approximation starting values
+- exporting numerical PSF curves for BEAMER-style workflows
 - educational and engineering use
 
-It is not meant to replace a fully calibrated production simulator.
+It is not meant to replace calibrated production workflows, CASINO, mcTrace, Geant4, PENELOPE, or experimental process calibration.
+
+## Why This Exists
+
+In practical EBL work, PEC values are often obtained by combining commercial Monte Carlo tools, custom scripts, and manual transfer of PSF parameters into layout software. This project aims to make that workflow faster and more transparent for stack-level exploration.
+
+The code keeps the model lightweight enough for interactive use while exposing diagnostics such as PSF normalization, fit residuals, fit window, export metadata, and warnings.
 
 ## Current Highlights
 
@@ -41,6 +52,7 @@ It is not meant to replace a fully calibrated production simulator.
 - PSF curve export as BEAMER-compatible compressed `.lpsf`, simple two-column `.psf`, or full diagnostic `.csv`
 - PSF normalization diagnostics, fit residual metrics, export metadata, and export roundtrip validation
 - legacy JSON migration with `schema_version`
+- no-GUI smoke test for fitting and export validation
 - fit plot viewer
 - live Monte Carlo progress window with:
   - electron count
@@ -223,7 +235,17 @@ The fit pipeline currently includes:
 
 ## Publishing To GitHub
 
-If you created a remote repository already:
+This local repository is intended to be published at:
+
+`git@github.com:serganom/ebl-stack-designer.git`
+
+If the remote is already configured:
+
+```bash
+git push
+```
+
+For a new clone or a newly initialized repository:
 
 ```bash
 git remote add origin <YOUR_GITHUB_REPO_URL>
