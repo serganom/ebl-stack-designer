@@ -1,5 +1,6 @@
 """Headless regressions for project provenance, load transactions and validation."""
 import copy
+from contextlib import ExitStack
 import importlib.util
 import json
 from pathlib import Path
@@ -76,9 +77,11 @@ class StateTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ebl_state_test_")
         self.addCleanup(self.temp.cleanup)
-        self.errors = self.enterContext(patch.object(m.messagebox, "showerror"))
-        self.enterContext(patch.object(m.messagebox, "showinfo"))
-        self.enterContext(patch.object(m.messagebox, "showwarning"))
+        contexts = ExitStack()
+        self.addCleanup(contexts.close)
+        self.errors = contexts.enter_context(patch.object(m.messagebox, "showerror"))
+        contexts.enter_context(patch.object(m.messagebox, "showinfo"))
+        contexts.enter_context(patch.object(m.messagebox, "showwarning"))
 
     def load_data(self, app, data):
         path = Path(self.temp.name) / "project.json"
