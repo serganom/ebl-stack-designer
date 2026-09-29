@@ -1,4 +1,5 @@
 import json
+import copy
 import os
 import tempfile
 import hashlib
@@ -15,12 +16,16 @@ np = None
 plt = None
 
 PROGRAM_NAME = "EBL Stack Designer"
-PROGRAM_VERSION = "0.4.0"
+PROGRAM_VERSION = "0.5.0"
 PROGRAM_CREATOR = "Sergei Nomoev"
-PROJECT_SCHEMA_VERSION = 2
+PROJECT_SCHEMA_VERSION = 3
 INTERNAL_LENGTH_UNIT = "nm"
 BEAMER_LENGTH_UNIT = "um"
-GAUSSIAN_CONVENTION = "G(r,w)=exp(-r^2/w^2), normalized numerically over sampled radial bins"
+GAUSSIAN_CONVENTION = "G(r,w)=exp(-r^2/w^2)/(pi*w^2), normalized on the full radial plane"
+LEGACY_GAUSSIAN_CONVENTION = "legacy: components normalized over the sampled fit window"
+PSF_REPRESENTATION_VERSION = 1
+PSF_EXPORT_TAIL_TOLERANCE = 1.0e-4
+PSF_EXPORT_MAX_RADIUS_NM = 1.0e8
 GAUSSIAN_FWHM_FACTOR = 2.0 * math.sqrt(math.log(2.0))
 
 
@@ -84,6 +89,112 @@ def safe_float(text, default=None):
     return float(text)
 
 
+def _transport_diagnostic_warnings(diagnostics):
+    """Surface lost trajectories instead of hiding them in PSF normalization."""
+    if not diagnostics:
+        return []
+    warnings = []
+    counts = diagnostics.get("termination_counts", {})
+    for key, description in (("max_collisions", "collision limit"), ("radial_limit", "radial limit")):
+        count = int(counts.get(key, 0))
+        if count:
+            warnings.append(f"{count} electron trajectories were stopped at the {description}; check convergence before using this PSF.")
+    outside = float(diagnostics.get("deposited_energy_selected_outside_radius_keV", 0.0))
+    selected = float(diagnostics.get("deposited_energy_selected_resist_keV", 0.0))
+    # A reporting threshold only; it does not alter transport or PSF values.
+    if selected > 0.0 and outside / selected > 0.001:
+        warnings.append(f"{100.0 * outside / selected:.3g}% of selected-resist deposition is outside the histogram; increase its radius.")
+    incident = float(diagnostics.get("incident_energy_keV", 0.0))
+    error = float(diagnostics.get("energy_balance_error_keV", 0.0))
+    if not math.isfinite(error) or abs(error) > 1e-8 * max(1.0, incident):
+        warnings.append("Transport energy accounting does not balance; do not use this result until resolved.")
+    return warnings
+
+
+def _finite_input(value, label, *, minimum=0.0, positive=False, optional=False):
+    if optional and (value is None or value == ""):
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be a number.")
+    try:
+        number = float(value)
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise ValueError(f"{label} must be a number.") from exc
+    if not math.isfinite(number) or number < minimum or (positive and number <= minimum):
+        relation = ">" if positive else ">="
+        raise ValueError(f"{label} must be finite and {relation} {minimum:g}.")
+    return number
+
+
+def _validated_material(material):
+    if not isinstance(material, dict):
+        raise ValueError("Each material must be an object.")
+    result = copy.deepcopy(material)
+    name = result.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("Material name is required.")
+    result["name"] = name.strip()
+    result["density_g_cm3"] = _finite_input(result.get("density_g_cm3"), "Density", positive=True)
+    for key in ("alias", "notes"):
+        if not isinstance(result.get(key, ""), str):
+            raise ValueError(f"Material {key} must be text.")
+        result.setdefault(key, "")
+    # Atomic fractions are derived from the canonical mass composition. Reject
+    # invalid provided values, but do not require independently rounded fractions
+    # to agree with one another before canonicalization.
+    elements = result.get("elements")
+    if not isinstance(elements, list) or not elements:
+        raise ValueError("At least one element is required.")
+    for element in elements:
+        if not isinstance(element, dict):
+            raise ValueError("Each element must be an object.")
+        if not isinstance(element.get("symbol"), str):
+            raise ValueError("Element symbol must be text.")
+        _finite_input(element.get("Z"), "Atomic number", positive=True)
+        _finite_input(element.get("weight_fraction"), "Mass fraction")
+        if "atomic_fraction" in element:
+            _finite_input(element["atomic_fraction"], "Atomic fraction")
+    result["elements"] = _canonical_material_elements(result)
+    return result
+
+
+def _validated_inputs(data):
+    """Validate and detach all simulation inputs before committing them to UI state."""
+    if not isinstance(data, dict):
+        raise ValueError("Project inputs must be an object.")
+    materials = data.get("materials")
+    stack = data.get("stack")
+    beam = data.get("beam")
+    if not isinstance(materials, list) or not isinstance(stack, list) or not isinstance(beam, dict):
+        raise ValueError("Project needs materials and stack lists and a beam object.")
+    materials = [_validated_material(mat) for mat in materials]
+    names = [mat["name"] for mat in materials]
+    if len(names) != len(set(names)):
+        raise ValueError("Material names must be unique.")
+    checked_stack = []
+    for i, layer in enumerate(stack):
+        if not isinstance(layer, dict):
+            raise ValueError(f"Layer {i + 1} must be an object.")
+        entry = copy.deepcopy(layer)
+        if entry.get("material_name") not in names:
+            raise ValueError(f"Layer {i + 1} references an unknown material.")
+        entry["thickness_nm"] = _finite_input(entry.get("thickness_nm"), f"Layer {i + 1} thickness", positive=True)
+        role = entry.get("role", "other")
+        if not isinstance(role, str):
+            raise ValueError(f"Layer {i + 1} role must be text.")
+        entry["role"] = role.strip() or "other"
+        checked_stack.append(entry)
+    checked_beam = copy.deepcopy(beam)
+    checked_beam["energy_keV"] = _finite_input(beam.get("energy_keV"), "Beam energy", positive=True)
+    checked_beam["beam_diameter_nm"] = _finite_input(beam.get("beam_diameter_nm"), "Beam diameter", optional=True)
+    checked_beam["current_pA"] = _finite_input(beam.get("current_pA"), "Beam current", optional=True)
+    unit = beam.get("current_input_unit", "pA")
+    if unit not in ("pA", "nA"):
+        raise ValueError("Current unit must be pA or nA.")
+    checked_beam["current_input_unit"] = unit
+    return {"beam": checked_beam, "materials": materials, "stack": checked_stack}
+
+
 def _norm(vals):
     s = float(sum(vals))
     if s <= 0:
@@ -108,6 +219,173 @@ def _radial_ring_area_nm2(r_nm):
     return np.where(np.isfinite(area) & (area > 0.0), area, 0.0)
 
 
+def _radial_bin_index(radius_nm, bin_width_nm=1.0):
+    # Bin i represents [i*dr, (i+1)*dr), with the stored radius its outer edge.
+    return int(math.floor(float(radius_nm) / float(bin_width_nm)))
+
+
+def _radial_energy_split(r_outer_nm, energy, cutoff_nm):
+    """Split all energy, including the center, using area fractions at a cut ring."""
+    _ensure_numpy()
+    r = np.asarray(r_outer_nm, dtype=float)
+    e = np.asarray(energy, dtype=float)
+    inner = np.concatenate(([0.0], r[:-1]))
+    fraction = np.clip((float(cutoff_nm) ** 2 - inner ** 2)
+                       / np.maximum(r ** 2 - inner ** 2, 1e-300), 0.0, 1.0)
+    if cutoff_nm <= 0:
+        fraction[:] = 0.0
+    forward = float(np.sum(e * fraction))
+    return forward, float(np.sum(e * (1.0 - fraction)))
+
+
+def _gaussian_psf(r_nm, width_nm):
+    _ensure_numpy()
+    width = float(width_nm)
+    if not math.isfinite(width) or width <= 0:
+        raise ValueError("Gaussian width must be finite and positive.")
+    r = np.asarray(r_nm, dtype=float)
+    return np.exp(-(r / width) ** 2) / (math.pi * width * width)
+
+
+def _power_psf(r_nm, exponent, core_radius_nm):
+    _ensure_numpy()
+    power, core = float(exponent), float(core_radius_nm)
+    if not math.isfinite(power) or power <= 2.0:
+        raise ValueError("A full-plane power PSF requires exponent p > 2.")
+    if not math.isfinite(core) or core <= 0:
+        raise ValueError("Power PSF core radius must be finite and positive.")
+    r = np.asarray(r_nm, dtype=float)
+    return (power - 2.0) / (2.0 * math.pi * core * core) * (1.0 + (r / core) ** 2) ** (-power / 2.0)
+
+
+def _ring_inner_radius_squared(r_outer_nm, ring_area_nm2):
+    _ensure_numpy()
+    outer = np.asarray(r_outer_nm, dtype=float)
+    area = np.asarray(ring_area_nm2, dtype=float)
+    if (outer.shape != area.shape or np.any(~np.isfinite(outer)) or np.any(outer <= 0.0)
+            or np.any(~np.isfinite(area)) or np.any(area <= 0.0)):
+        raise ValueError("PSF ring areas must be positive, finite and match the radii.")
+    inner2 = outer ** 2 - area / math.pi
+    if np.any(inner2 < -1e-9 * np.maximum(1.0, outer ** 2)):
+        raise ValueError("PSF ring area exceeds its outer circle.")
+    return np.maximum(inner2, 0.0), area
+
+
+def _gaussian_ring_psf(r_outer_nm, ring_area_nm2, width_nm):
+    """Exact annular area average of a globally normalized Gaussian."""
+    inner2, area = _ring_inner_radius_squared(r_outer_nm, ring_area_nm2)
+    width = float(width_nm)
+    if not math.isfinite(width) or width <= 0.0:
+        raise ValueError("Gaussian width must be finite and positive.")
+    width2 = width * width
+    # expm1 preserves narrow-ring energy differences for a broad component.
+    return np.exp(-inner2 / width2) * (-np.expm1(-area / (math.pi * width2))) / area
+
+
+def _power_ring_psf(r_outer_nm, ring_area_nm2, exponent, core_radius_nm):
+    """Exact annular average from differences of the analytic power tail mass."""
+    inner2, area = _ring_inner_radius_squared(r_outer_nm, ring_area_nm2)
+    power, core = float(exponent), float(core_radius_nm)
+    if not math.isfinite(power) or power <= 2.0:
+        raise ValueError("A full-plane power PSF requires exponent p > 2.")
+    if not math.isfinite(core) or core <= 0.0:
+        raise ValueError("Power PSF core radius must be finite and positive.")
+    core2 = core * core
+    exponent_tail = 1.0 - power / 2.0
+    log_inner_tail = exponent_tail * np.log1p(inner2 / core2)
+    log_tail_ratio = exponent_tail * np.log1p(area / (math.pi * (core2 + inner2)))
+    return np.exp(log_inner_tail) * (-np.expm1(log_tail_ratio)) / area
+
+
+def _evaluate_psf_ring_average(model, r_outer_nm, ring_area_nm2, include_amplitude=True):
+    """Predict histogram-bin averages; numerical exports use the point evaluator."""
+    if model.get("version") != PSF_REPRESENTATION_VERSION:
+        raise ValueError("Unsupported or missing PSF model representation; rerun the fit.")
+    eta = float(model["eta"])
+    if not math.isfinite(eta) or eta < 0.0:
+        raise ValueError("PSF eta must be finite and non-negative.")
+    if model["model"] == "power_gaussian":
+        forward = _power_ring_psf(r_outer_nm, ring_area_nm2, model["alpha_power"], model["core_radius_nm"])
+    else:
+        forward = _gaussian_ring_psf(r_outer_nm, ring_area_nm2, model["alpha_nm"])
+    numerator = forward + eta * _gaussian_ring_psf(r_outer_nm, ring_area_nm2, model["beta_nm"])
+    denominator = 1.0 + eta
+    for index in (1, 2):
+        weight = float(model.get(f"nue{index}", 0.0))
+        if weight > 0.0:
+            numerator += weight * _gaussian_ring_psf(r_outer_nm, ring_area_nm2, model[f"gamma{index}_nm"])
+            denominator += weight
+    amplitude = float(model.get("amplitude", 1.0)) if include_amplitude else 1.0
+    return amplitude * numerator / denominator
+
+
+def _evaluate_psf_model(model, r_nm, include_amplitude=True):
+    """Evaluate a versioned, globally normalized model independently of sampling."""
+    _ensure_numpy()
+    if model.get("version") != PSF_REPRESENTATION_VERSION:
+        raise ValueError("Unsupported or missing PSF model representation; rerun the fit.")
+    r = np.asarray(r_nm, dtype=float)
+    if np.any(~np.isfinite(r)) or np.any(r < 0):
+        raise ValueError("PSF radii must be finite and non-negative.")
+    eta = float(model["eta"])
+    if not math.isfinite(eta) or eta < 0:
+        raise ValueError("PSF eta must be finite and non-negative.")
+    if model["model"] == "power_gaussian":
+        forward = _power_psf(r, model["alpha_power"], model["core_radius_nm"])
+    else:
+        forward = _gaussian_psf(r, model["alpha_nm"])
+    numerator = forward + eta * _gaussian_psf(r, model["beta_nm"])
+    denominator = 1.0 + eta
+    for index in (1, 2):
+        weight = float(model.get(f"nue{index}", 0.0))
+        if weight > 0.0:
+            numerator = numerator + weight * _gaussian_psf(r, model[f"gamma{index}_nm"])
+            denominator += weight
+    amplitude = float(model.get("amplitude", 1.0)) if include_amplitude else 1.0
+    return amplitude * numerator / denominator
+
+
+def _psf_model_tail_fraction(model, radius_nm):
+    """Exact remaining normalized mass outside a radius, before fit amplitude."""
+    r = float(radius_nm)
+    eta = float(model["eta"])
+    if model["model"] == "power_gaussian":
+        p = float(model["alpha_power"])
+        if p <= 2.0:
+            raise ValueError("A full-plane power PSF requires exponent p > 2.")
+        forward = (1.0 + (r / float(model["core_radius_nm"])) ** 2) ** (1.0 - p / 2.0)
+    else:
+        forward = math.exp(-(r / float(model["alpha_nm"])) ** 2)
+    numerator = forward + eta * math.exp(-(r / float(model["beta_nm"])) ** 2)
+    denominator = 1.0 + eta
+    for index in (1, 2):
+        weight = float(model.get(f"nue{index}", 0.0))
+        if weight > 0.0:
+            numerator += weight * math.exp(-(r / float(model[f"gamma{index}_nm"])) ** 2)
+            denominator += weight
+    return numerator / denominator
+
+
+def _fit_representation(result, amplitude=1.0, core_radius_nm=None):
+    model = {
+        "version": PSF_REPRESENTATION_VERSION,
+        "model": result.get("fit_model", "beamer_gaussian"),
+        "normalization": "full_plane_area_integral_one",
+        "eta_semantics": "global_component_integral_ratio",
+        "beta_nm": float(result["beta_nm"]),
+        "eta": float(result["eta_fit"]),
+        "amplitude": float(amplitude),
+    }
+    if model["model"] == "power_gaussian":
+        model.update(alpha_power=float(result["alpha_power"]), core_radius_nm=float(core_radius_nm))
+    else:
+        model["alpha_nm"] = float(result["alpha_nm"])
+    for key in ("gamma1_nm", "gamma2_nm", "nue1", "nue2"):
+        if key in result:
+            model[key] = float(result[key])
+    return model
+
+
 def _density_integral(density, ring_area):
     _ensure_numpy()
     y = np.asarray(density, dtype=float)
@@ -128,18 +406,50 @@ def _cumulative_from_density(density, ring_area):
     return np.cumsum(contrib)
 
 
-def _mat(name, alias, density, elements, notes=""):
-    # elements: list of tuples (symbol, Z, weight_fraction, atomic_fraction)
-    wf = _norm([e[2] for e in elements])
-    af = _norm([e[3] for e in elements])
-    out_elems = []
-    for i, e in enumerate(elements):
-        out_elems.append({
-            "symbol": e[0],
-            "Z": int(e[1]),
-            "weight_fraction": wf[i],
-            "atomic_fraction": af[i],
+def _canonical_material_elements(material):
+    """Derive one consistent composition from the supplied mass fractions."""
+    elements = material.get("elements", [])
+    if not elements:
+        raise ValueError("Material must contain at least one element.")
+    normalized = []
+    for element in elements:
+        symbol = str(element.get("symbol", "")).strip().capitalize()
+        expected_z = ATOMIC_NUMBERS.get(symbol)
+        if expected_z is None:
+            raise ValueError(f"Unknown element symbol: {symbol!r}.")
+        z = float(element.get("Z", 0))
+        if not math.isfinite(z) or z != expected_z:
+            raise ValueError(f"Atomic number for {symbol} must be {expected_z}.")
+        weight = float(element.get("weight_fraction", 0.0))
+        if not math.isfinite(weight) or weight < 0.0:
+            raise ValueError(f"Mass fraction for {symbol} must be finite and nonnegative.")
+        normalized.append({
+            "symbol": symbol,
+            "Z": expected_z,
+            "weight_fraction": weight,
         })
+    try:
+        weight_sum = math.fsum(element["weight_fraction"] for element in normalized)
+    except OverflowError as exc:
+        raise ValueError("Material mass fractions must have a finite positive sum.") from exc
+    if not math.isfinite(weight_sum) or weight_sum <= 0.0:
+        raise ValueError("Material mass fractions must have a finite positive sum.")
+    atom_amounts = []
+    for element in normalized:
+        element["weight_fraction"] /= weight_sum
+        atomic_weight = _estimate_atomic_weight(element["symbol"], element["Z"])
+        atom_amounts.append(element["weight_fraction"] / atomic_weight)
+    atom_sum = math.fsum(atom_amounts)
+    for element, atom_amount in zip(normalized, atom_amounts):
+        element["atomic_fraction"] = atom_amount / atom_sum
+    return normalized
+
+
+def _mat(name, alias, density, elements, notes=""):
+    # Legacy preset tuples include atomic fractions; mass fractions are canonical.
+    out_elems = _canonical_material_elements({"elements": [
+        {"symbol": e[0], "Z": e[1], "weight_fraction": e[2]} for e in elements
+    ]})
     return {
         "name": name,
         "alias": alias,
@@ -379,16 +689,37 @@ def preset_stack_templates():
     ]
 
 
+# CIAAW Abridged Standard Atomic Weights 2024 (normal terrestrial materials).
+# https://ciaaw.org/abridged-atomic-weights.htm
+# Elements without a standard weight require an isotope-aware model; no A=2Z fallback.
 ATOMIC_WEIGHTS = {
-    "H": 1.008, "B": 10.81, "C": 12.011, "N": 14.007, "O": 15.999, "F": 18.998,
-    "Na": 22.990, "Mg": 24.305, "Al": 26.982, "Si": 28.085, "P": 30.974, "S": 32.06,
-    "Cl": 35.45, "K": 39.098, "Ca": 40.078, "Ti": 47.867, "Cr": 51.996, "Mn": 54.938,
-    "Fe": 55.845, "Co": 58.933, "Ni": 58.693, "Cu": 63.546, "Zn": 65.38, "Ga": 69.723,
-    "Ge": 72.630, "As": 74.922, "Se": 78.971, "Br": 79.904, "Rb": 85.468, "Sr": 87.62,
-    "Y": 88.906, "Zr": 91.224, "Nb": 92.906, "Mo": 95.95, "In": 114.818, "Sn": 118.710,
-    "Sb": 121.760, "Te": 127.60, "I": 126.904, "Cs": 132.905, "Ba": 137.327, "Hf": 178.49,
-    "Ta": 180.948, "W": 183.84, "Pt": 195.084, "Au": 196.967, "Hg": 200.592, "Pb": 207.2,
+    "H": 1.0080, "He": 4.0026, "Li": 6.94, "Be": 9.0122, "B": 10.81,
+    "C": 12.011, "N": 14.007, "O": 15.999, "F": 18.998, "Ne": 20.180,
+    "Na": 22.990, "Mg": 24.305, "Al": 26.982, "Si": 28.085, "P": 30.974,
+    "S": 32.06, "Cl": 35.45, "Ar": 39.95, "K": 39.098, "Ca": 40.078,
+    "Sc": 44.956, "Ti": 47.867, "V": 50.942, "Cr": 51.996, "Mn": 54.938,
+    "Fe": 55.845, "Co": 58.933, "Ni": 58.693, "Cu": 63.546, "Zn": 65.38,
+    "Ga": 69.723, "Ge": 72.630, "As": 74.922, "Se": 78.971, "Br": 79.904,
+    "Kr": 83.798, "Rb": 85.468, "Sr": 87.62, "Y": 88.906, "Zr": 91.222,
+    "Nb": 92.906, "Mo": 95.95, "Ru": 101.07, "Rh": 102.91, "Pd": 106.42,
+    "Ag": 107.87, "Cd": 112.41, "In": 114.82, "Sn": 118.71, "Sb": 121.76,
+    "Te": 127.60, "I": 126.90, "Xe": 131.29, "Cs": 132.91, "Ba": 137.33,
+    "La": 138.91, "Ce": 140.12, "Pr": 140.91, "Nd": 144.24, "Sm": 150.36,
+    "Eu": 151.96, "Gd": 157.25, "Tb": 158.93, "Dy": 162.50, "Ho": 164.93,
+    "Er": 167.26, "Tm": 168.93, "Yb": 173.05, "Lu": 174.97, "Hf": 178.49,
+    "Ta": 180.95, "W": 183.84, "Re": 186.21, "Os": 190.23, "Ir": 192.22,
+    "Pt": 195.08, "Au": 196.97, "Hg": 200.59, "Tl": 204.38, "Pb": 207.2,
+    "Bi": 208.98, "Th": 232.04, "Pa": 231.04, "U": 238.03,
 }
+# Element identity is validated independently of the available mass table.
+_ELEMENT_SYMBOLS = (
+    "H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe Co Ni Cu Zn "
+    "Ga Ge As Se Br Kr Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I Xe Cs Ba "
+    "La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu Hf Ta W Re Os Ir Pt Au Hg Tl Pb "
+    "Bi Po At Rn Fr Ra Ac Th Pa U Np Pu Am Cm Bk Cf Es Fm Md No Lr Rf Db Sg Bh Hs "
+    "Mt Ds Rg Cn Nh Fl Mc Lv Ts Og"
+).split()
+ATOMIC_NUMBERS = {symbol: index for index, symbol in enumerate(_ELEMENT_SYMBOLS, 1)}
 ELECTRON_REST_ENERGY_KEV = 511.0
 
 
@@ -435,6 +766,12 @@ def _screened_rutherford_theta(zeff, energy_keV, rng):
 
 
 def _bethe_stopping_keV_per_nm(energy_keV, props):
+    """Legacy uncalibrated blend, not the pure modified-Bethe expression.
+
+    The repository does not establish a literature source for 0.65/0.35 or
+    0.72. Keep these visible until an independent stopping benchmark selects
+    a replacement; see docs/CORRECTNESS_REVIEW.md.
+    """
     e = max(float(energy_keV), 0.02)
     rho = max(0.1, float(props.get("rho", 1.0)))
     deds = 0.0
@@ -462,20 +799,20 @@ def _is_high_tension_thin_resist(beam_energy_keV, resist_thickness_nm):
 
 
 def _estimate_atomic_weight(symbol, z):
-    return ATOMIC_WEIGHTS.get(symbol, max(1.0, 2.0 * float(z)))
+    symbol = str(symbol).strip().capitalize()
+    if symbol not in ATOMIC_WEIGHTS:
+        raise ValueError(
+            f"No standard atomic weight is available for {symbol!r}; "
+            "an isotope-specific material model is required."
+        )
+    return ATOMIC_WEIGHTS[symbol]
 
 
 def _material_mc_properties(material):
-    elements = material.get("elements", [])
-    rho = float(material.get("density_g_cm3", 1.0) or 1.0)
-    if not elements:
-        j0 = _mean_ionization_energy_keV(6)
-        return {
-            "rho": rho, "zeff_af": 10.0, "z_back": 10.0, "a_eff": 20.0,
-            "scatter_strength": rho, "stop_strength": rho,
-            "mean_I_eV": 75.0, "ko_range_coeff_nm": 2500.0,
-            "bragg_wZ": [(6.0, 12.011, 1.0, j0)],
-        }
+    elements = _canonical_material_elements(material)
+    rho = float(material.get("density_g_cm3", 1.0))
+    if not math.isfinite(rho) or rho <= 0.0:
+        raise ValueError("Material density must be finite and > 0.")
     af_sum = sum(float(e.get("atomic_fraction", 0.0)) for e in elements) or 1.0
     wf_sum = sum(float(e.get("weight_fraction", 0.0)) for e in elements) or 1.0
     zeff_af = sum(float(e.get("atomic_fraction", 0.0)) / af_sum * float(e.get("Z", 0.0)) for e in elements)
@@ -636,7 +973,7 @@ class ElementRow:
         ttk.Entry(self.frame, width=8, textvariable=self.symbol_var).grid(row=0, column=0, padx=2, pady=2)
         ttk.Entry(self.frame, width=8, textvariable=self.z_var).grid(row=0, column=1, padx=2, pady=2)
         ttk.Entry(self.frame, width=12, textvariable=self.wf_var).grid(row=0, column=2, padx=2, pady=2)
-        ttk.Entry(self.frame, width=12, textvariable=self.af_var).grid(row=0, column=3, padx=2, pady=2)
+        ttk.Entry(self.frame, width=12, textvariable=self.af_var, state="readonly").grid(row=0, column=3, padx=2, pady=2)
         ttk.Button(self.frame, text="Remove", command=lambda: remove_callback(self)).grid(row=0, column=4, padx=2, pady=2)
 
     def to_dict(self):
@@ -684,7 +1021,7 @@ class MaterialDialog(tk.Toplevel):
         ttk.Label(cols, text="Element").grid(row=0, column=0, padx=2)
         ttk.Label(cols, text="Z").grid(row=0, column=1, padx=2)
         ttk.Label(cols, text="Weight frac").grid(row=0, column=2, padx=2)
-        ttk.Label(cols, text="Atomic frac").grid(row=0, column=3, padx=2)
+        ttk.Label(cols, text="Atomic frac (derived)").grid(row=0, column=3, padx=2)
 
         self.rows_frame = ttk.Frame(top)
         self.rows_frame.grid(row=5, column=0, columnspan=2, sticky="nsew")
@@ -723,46 +1060,21 @@ class MaterialDialog(tk.Toplevel):
 
     def normalize_fractions(self):
         try:
-            w = [safe_float(r.wf_var.get(), 0.0) for r in self.element_rows]
-            a = [safe_float(r.af_var.get(), 0.0) for r in self.element_rows]
-            sw = sum(w)
-            sa = sum(a)
-            if sw > 0:
-                for r, v in zip(self.element_rows, w):
-                    r.wf_var.set(f"{v / sw:.6f}")
-            if sa > 0:
-                for r, v in zip(self.element_rows, a):
-                    r.af_var.set(f"{v / sa:.6f}")
+            elements = _canonical_material_elements({"elements": [r.to_dict() for r in self.element_rows]})
+            for row, element in zip(self.element_rows, elements):
+                row.set_from_dict(element)
         except Exception as exc:
             messagebox.showerror("Normalize Error", str(exc), parent=self)
 
     def save(self):
         try:
-            name = self.name_var.get().strip()
-            if not name:
-                raise ValueError("Material name is required.")
-            density = safe_float(self.density_var.get())
-            if density is None or density <= 0:
-                raise ValueError("Density must be > 0.")
-
-            elements = [r.to_dict() for r in self.element_rows]
-            if not elements:
-                raise ValueError("At least one element is required.")
-
-            wf_sum = sum(e["weight_fraction"] for e in elements)
-            af_sum = sum(e["atomic_fraction"] for e in elements)
-            if abs(wf_sum - 1.0) > 0.02:
-                raise ValueError(f"Weight fractions must sum to ~1.0 (current {wf_sum:.4f}).")
-            if abs(af_sum - 1.0) > 0.02:
-                raise ValueError(f"Atomic fractions must sum to ~1.0 (current {af_sum:.4f}).")
-
-            self.result = {
-                "name": name,
+            self.result = _validated_material({
+                "name": self.name_var.get().strip(),
                 "alias": self.alias_var.get().strip(),
-                "density_g_cm3": density,
+                "density_g_cm3": self.density_var.get(),
                 "notes": self.notes_var.get().strip(),
-                "elements": elements,
-            }
+                "elements": [r.to_dict() for r in self.element_rows],
+            })
             self.destroy()
         except Exception as exc:
             messagebox.showerror("Material Error", str(exc), parent=self)
@@ -957,6 +1269,8 @@ class StackDesignerApp:
         self.mat_tree.bind("<<TreeviewSelect>>", lambda e: self.show_selected_material_summary())
         self.last_fit_result = None
         self.fit_info_var = tk.StringVar(value="No PEC fit yet.")
+        for variable in (self.energy_var, self.diam_var, self.current_var):
+            variable.trace_add("write", lambda *_: self._refresh_fit_info())
         ttk.Label(footer, textvariable=self.fit_info_var).pack(anchor="w", pady=(6, 0))
         ttk.Label(footer, text="made by Sergei Nomoev", foreground="#666").pack(anchor="e", pady=(4, 0))
 
@@ -1037,6 +1351,7 @@ class StackDesignerApp:
         self.total_stack_var.set(f"Total stack thickness: {total:.3f} nm")
         self._update_selected_layer_detail()
         self.draw_stack_preview()
+        self._refresh_fit_info()
 
     def selected_material_index(self):
         sel = self.mat_tree.selection()
@@ -1072,6 +1387,9 @@ class StackDesignerApp:
         dlg = MaterialDialog(self.root)
         self.root.wait_window(dlg)
         if dlg.result:
+            if any(m["name"] == dlg.result["name"] for m in self.materials):
+                messagebox.showerror("Material Error", "A material with this name already exists.")
+                return
             self.materials.append(dlg.result)
             self.project["materials"] = self.materials
             self.refresh_materials()
@@ -1152,7 +1470,9 @@ class StackDesignerApp:
             self.project["stack"].append(dict(layer))
 
         self.project["materials"] = self.materials
-        self.refresh_all()
+        self.refresh_materials()
+        self.refresh_stack()
+        self._refresh_fit_info()
         messagebox.showinfo(
             "Preset Stack Added",
             f"Template: {tmpl['name']}\nAdded materials: {added_mats}\nLayers now in stack: {len(self.project['stack'])}"
@@ -1249,13 +1569,18 @@ class StackDesignerApp:
         dlg = MaterialDialog(self.root, self.materials[idx])
         self.root.wait_window(dlg)
         if dlg.result:
+            if any(i != idx and mat["name"] == dlg.result["name"] for i, mat in enumerate(self.materials)):
+                messagebox.showerror("Material Error", "A material with this name already exists.")
+                return
             old_name = self.materials[idx]["name"]
             self.materials[idx] = dlg.result
             new_name = dlg.result["name"]
             for layer in self.project.get("stack", []):
                 if layer.get("material_name") == old_name:
                     layer["material_name"] = new_name
-            self.refresh_all()
+            self.refresh_materials()
+            self.refresh_stack()
+            self._refresh_fit_info()
 
     def delete_material(self):
         idx = self.selected_material_index()
@@ -1308,9 +1633,7 @@ class StackDesignerApp:
 
         def on_ok():
             try:
-                t = safe_float(thick_var.get())
-                if t is None or t < 0:
-                    raise ValueError("Thickness must be >= 0 nm.")
+                t = _finite_input(thick_var.get(), "Thickness", positive=True)
                 rec = {
                     "material_name": mat_var.get().strip(),
                     "thickness_nm": t,
@@ -1462,27 +1785,31 @@ class StackDesignerApp:
 
         c.create_text(left + pw / 2, h - 8, text=f"Top → Bottom (visual thickness compressed) | Physical total = {total_phys:.3f} nm", fill="#555", font=("Helvetica", 9))
 
-    def collect_project(self):
+    def _beam_from_fields(self):
         current_value = safe_float(self.current_var.get(), None)
         current_unit = str(self.current_unit_var.get() or "pA")
-        if current_unit not in ("pA", "nA"):
-            current_unit = "pA"
-        self.project["project_name"] = self.project_name_var.get().strip() or "Untitled"
-        self.project["beam"] = {
+        return {
             "energy_keV": safe_float(self.energy_var.get()),
             "beam_diameter_nm": safe_float(self.diam_var.get(), None),
             "current_pA": None if current_value is None else self._convert_current_value(current_value, current_unit, "pA"),
             "current_input_unit": current_unit,
         }
-        self.project["schema_version"] = PROJECT_SCHEMA_VERSION
-        self.project["program"] = {
+
+    def collect_project(self):
+        candidate = dict(self.project)
+        candidate["project_name"] = self.project_name_var.get().strip() or "Untitled"
+        candidate["beam"] = self._beam_from_fields()
+        candidate["materials"] = self.materials
+        inputs = _validated_inputs(candidate)
+        candidate.update(inputs)
+        candidate["schema_version"] = PROJECT_SCHEMA_VERSION
+        candidate["program"] = {
             "name": PROGRAM_NAME,
             "version": PROGRAM_VERSION,
             "creator": PROGRAM_CREATOR,
         }
-        if self.project["beam"]["energy_keV"] is None or self.project["beam"]["energy_keV"] <= 0:
-            raise ValueError("Electron energy (keV) must be > 0.")
-        self.project["materials"] = self.materials
+        self.project = candidate
+        self.materials = candidate["materials"]
         return self.project
 
     def save_project(self):
@@ -1510,38 +1837,107 @@ class StackDesignerApp:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             data, migration_warnings = self._migrate_project_data(data)
-            self.project = data
-            self.project_path = path
-            self.refresh_all()
+            previous = (self.project, self.project_path, self.materials, self.last_fit_result)
+            field_names = ("project_name_var", "energy_var", "diam_var", "current_var", "current_unit_var")
+            previous_fields = {name: getattr(self, name).get() for name in field_names}
+            try:
+                self.project = data
+                self.project_path = path
+                self.materials = data["materials"]
+                fits = data.get("pec_fits", [])
+                self.last_fit_result = copy.deepcopy(fits[-1]) if fits else None
+                self.refresh_all()
+            except Exception:
+                self.project, self.project_path, self.materials, self.last_fit_result = previous
+                try:
+                    self.refresh_all()
+                finally:
+                    for name, value in previous_fields.items():
+                        getattr(self, name).set(value)
+                raise
             extra = "" if not migration_warnings else "\n\n" + "\n".join(migration_warnings)
             messagebox.showinfo("Loaded", f"Loaded project:\n{path}{extra}")
         except Exception as exc:
             messagebox.showerror("Load Error", str(exc))
 
+    def _validated_fit_record(self, fit):
+        if not isinstance(fit, dict):
+            raise ValueError("Each stored fit must be an object.")
+        result = copy.deepcopy(fit)
+        model = result.get("fit_model", "double_gaussian")
+        if model not in ("double_gaussian", "power_gaussian"):
+            raise ValueError("Unknown stored PSF model.")
+        result["fit_model"] = model
+        for name in ("beta_nm", "eta_fit"):
+            result[name] = _finite_input(result.get(name), f"Fit {name}", positive=name == "beta_nm")
+        forward = "alpha_power" if model == "power_gaussian" else "alpha_nm"
+        result[forward] = _finite_input(result.get(forward), f"Fit {forward}", positive=True)
+        for name in ("layer_pattern", "input_file"):
+            if not isinstance(result.get(name, ""), str):
+                raise ValueError(f"Fit {name} must be text.")
+        for key in ("simulation", "psf_diagnostics", "fit_diagnostics", "fit_candidates", "beamer_gaussian"):
+            if key in result and not isinstance(result[key], dict):
+                raise ValueError(f"Fit {key} must be an object.")
+        if "warnings" in result and (not isinstance(result["warnings"], list) or any(not isinstance(w, str) for w in result["warnings"])):
+            raise ValueError("Fit warnings must be a list of text messages.")
+        if "input_snapshot" in result:
+            result["input_snapshot"] = _validated_inputs(result["input_snapshot"])
+        if "plot_data" in result:
+            curves = result["plot_data"]
+            if not isinstance(curves, dict):
+                raise ValueError("Fit plot_data must be an object.")
+            radii = curves.get("r_nm", [])
+            if not isinstance(radii, list):
+                raise ValueError("Fit radii must be a list.")
+            checked_r = [_finite_input(r, "Fit radius", positive=True) for r in radii]
+            if any(right <= left for left, right in zip(checked_r, checked_r[1:])):
+                raise ValueError("Fit radii must be strictly increasing.")
+            for key in ("measured_density", "fitted_density", "beamer_gaussian_density", "log10_residual"):
+                if key not in curves:
+                    continue
+                values = curves[key]
+                if not isinstance(values, list) or len(values) != len(radii):
+                    raise ValueError(f"Fit {key} must have one value per radius.")
+                minimum = -float("inf") if key == "log10_residual" else 0.0
+                for value in values:
+                    _finite_input(value, f"Fit {key}", minimum=minimum)
+        return result
+
     def _migrate_project_data(self, data):
         if not isinstance(data, dict):
             raise ValueError("Invalid project file.")
-        if "materials" not in data or "stack" not in data or "beam" not in data:
-            raise ValueError("Invalid project file.")
+        data = copy.deepcopy(data)
+        version = _finite_input(data.get("schema_version", 1), "Project schema version", positive=True)
+        if version != int(version) or version > PROJECT_SCHEMA_VERSION:
+            raise ValueError("Unsupported project schema version.")
         warnings = []
-        try:
-            schema_version = int(float(data.get("schema_version", 1) or 1))
-        except Exception:
-            schema_version = 1
-        if schema_version < 2:
-            warnings.append("Legacy JSON project detected: missing fields were filled with safe defaults.")
-            data.setdefault("pec_fits", [])
+        if version < PROJECT_SCHEMA_VERSION:
+            warnings.append("Legacy JSON project detected: missing optional fields were filled with defaults.")
+        checked_inputs = _validated_inputs(data)
+        composition_changed = any(
+            "atomic_fraction" not in original
+            or abs(float(original["atomic_fraction"]) - checked["atomic_fraction"]) > 1e-6
+            for original_mat, checked_mat in zip(data["materials"], checked_inputs["materials"])
+            for original, checked in zip(original_mat["elements"], checked_mat["elements"])
+        )
+        if composition_changed:
+            warnings.append("Atomic fractions were recalculated from the supplied mass composition; old independently specified atomic fractions were not used.")
+        data.update(checked_inputs)
+        for key in ("project_name", "notes"):
+            default = "Untitled" if key == "project_name" else ""
+            if not isinstance(data.get(key, default), str):
+                raise ValueError(f"Project {key} must be text.")
+            data.setdefault(key, default)
+        if "program" in data and not isinstance(data["program"], dict):
+            raise ValueError("Project program metadata must be an object.")
+        data.setdefault("program", {"name": PROGRAM_NAME, "version": PROGRAM_VERSION, "creator": PROGRAM_CREATOR})
+        fits = data.get("pec_fits", [])
+        if not isinstance(fits, list):
+            raise ValueError("Project pec_fits must be a list.")
+        data["pec_fits"] = [self._validated_fit_record(fit) for fit in fits]
+        if any("input_snapshot" not in fit for fit in data["pec_fits"]):
+            warnings.append("Stored legacy fits have no complete input snapshot. Run Simulation + Fit again before exporting them.")
         data["schema_version"] = PROJECT_SCHEMA_VERSION
-        data.setdefault("project_name", "Untitled")
-        data.setdefault("program", {
-            "name": PROGRAM_NAME,
-            "version": PROGRAM_VERSION,
-            "creator": PROGRAM_CREATOR,
-        })
-        beam = data.setdefault("beam", {})
-        beam.setdefault("beam_diameter_nm", None)
-        beam.setdefault("current_pA", None)
-        beam.setdefault("current_input_unit", "pA")
         return data, warnings
 
     def export_summary(self):
@@ -1563,7 +1959,7 @@ class StackDesignerApp:
                 lines.append(f"Beam current: {current_display:g} {export_unit} ({data['beam']['current_pA']:.6g} pA)")
             if self.last_fit_result:
                 lines.append("")
-                lines.append("Last PEC fit result")
+                lines.append(f"Last PEC fit result (input state: {self._fit_state(self.last_fit_result)})")
                 lines.append(f"Model: {self._fit_model_display_name(self.last_fit_result)}")
                 lines.append(f"Layer: {self.last_fit_result.get('layer_pattern')}")
                 lines.append(f"Source: {self.last_fit_result.get('input_file')}")
@@ -1633,6 +2029,7 @@ class StackDesignerApp:
                 res = fits[-1] if fits else None
             if not res:
                 raise ValueError("No PEC fit available. Run Simulation + Fit first.")
+            self._require_exportable_fit(res)
             plot_data = res.get("plot_data") or {}
             r_nm = plot_data.get("r_nm") or []
             y_fit = plot_data.get("fitted_density") or []
@@ -1684,17 +2081,12 @@ class StackDesignerApp:
     def _write_psf_two_column(self, path, fit_result):
         _ensure_numpy()
         self._validate_export_source_curve(fit_result)
-        plot_data = fit_result.get("plot_data") or {}
-        r_nm = np.asarray(plot_data.get("r_nm", []), dtype=float)
-        y_fit = np.asarray(plot_data.get("fitted_density", []), dtype=float)
-        if r_nm.size == 0 or y_fit.size != r_nm.size:
-            raise ValueError("Invalid PSF curve data.")
+        r_nm, y_fit, curve_metadata = self._export_curve_data(fit_result)
         radius_um = r_nm * 1.0e-3
         density_per_um2 = y_fit * 1.0e6
-        mask = np.isfinite(radius_um) & np.isfinite(density_per_um2) & (radius_um > 0) & (density_per_um2 > 0)
         lines = [
             f"{x_um:.9g} {val:.12e}"
-            for x_um, val in zip(radius_um[mask], density_per_um2[mask])
+            for x_um, val in zip(radius_um, density_per_um2)
         ]
         self._atomic_write_text(path, "\n".join(lines) + "\n", self._validate_psf_two_column_file)
 
@@ -1716,7 +2108,8 @@ class StackDesignerApp:
         if log_resid.size != r_nm.size:
             log_resid = np.full_like(r_nm, float("nan"))
         radius_um = r_nm * 1.0e-3
-        area = _radial_ring_area_nm2(r_nm)
+        stored_area = np.asarray(plot_data.get("ring_area_nm2", []), dtype=float)
+        area = stored_area if stored_area.size == r_nm.size else _radial_ring_area_nm2(r_nm)
         cumulative_meas = _cumulative_from_density(y_meas, area)
         cumulative_fit = _cumulative_from_density(y_fit, area)
         metadata = self._export_metadata(fit_result)
@@ -1735,7 +2128,7 @@ class StackDesignerApp:
             f"# random_seed,{metadata['random_seed']}",
             f"# selected_resist_layers,{metadata['selected_resist_layers']}",
             f"# model,{self._fit_model_display_name(fit_result)}",
-            f"# gaussian_convention,{GAUSSIAN_CONVENTION}",
+            f"# gaussian_convention,{fit_result.get('gaussian_convention', LEGACY_GAUSSIAN_CONVENTION)}",
             f"# internal_length_unit,{INTERNAL_LENGTH_UNIT}",
             f"# beamer_length_unit,{BEAMER_LENGTH_UNIT}",
             f"# psf_normalization,{metadata['psf_normalization']}",
@@ -1746,6 +2139,8 @@ class StackDesignerApp:
             f"# fit_weighted_mse_log10,{metadata['fit_weighted_mse_log10']}",
             f"# fit_unweighted_mse_log10,{metadata['fit_unweighted_mse_log10']}",
             f"# warnings,{metadata['warnings']}",
+            "# curve_domain,fit_window (diagnostic data; numerical PSF/LPSF exports use the full model)",
+            f"# sample_representation,{plot_data.get('sample_representation', 'legacy_outer_radius_point_approximation')}",
             "# density columns are converted from 1/nm^2 to 1/um^2",
             "radius_um,measured_density_per_um2,selected_fit_density_per_um2,beamer_gaussian_density_per_um2,cumulative_measured,cumulative_selected_fit,log10_residual_selected_minus_measured",
         ]
@@ -1764,11 +2159,12 @@ class StackDesignerApp:
     def _write_lpsf_archive(self, path, fit_result):
         self._validate_export_source_curve(fit_result)
         points, curve_meta = self._build_lpsf_curve_points(fit_result)
-        stack = fit_result.get("stack_snapshot") or self.project.get("stack", [])
-        stack = [dict(layer) for layer in stack]
+        snapshot = self._fit_input_snapshot(fit_result) or {}
+        stack = snapshot.get("stack", fit_result.get("stack_snapshot", []))
+        stack = copy.deepcopy(stack)
         sim = fit_result.get("simulation") or {}
 
-        beam = dict(fit_result.get("beam") or self.project.get("beam", {}))
+        beam = copy.deepcopy(snapshot.get("beam", fit_result.get("beam", {})))
         energy_keV = fit_result.get("beam_energy_keV") or sim.get("beam_energy_keV") or beam.get("energy_keV") or 0.0
         try:
             energy_keV = float(energy_keV)
@@ -1893,8 +2289,9 @@ class StackDesignerApp:
                 raise ValueError(f"Refusing export: normalized PSF integral is {psf_integral:.6g}, expected approximately 1.")
 
     def _export_metadata(self, fit_result):
-        stack = fit_result.get("stack_snapshot") or self.project.get("stack", [])
-        materials = self.project.get("materials", self.materials if hasattr(self, "materials") else [])
+        snapshot = self._fit_input_snapshot(fit_result) or {}
+        stack = snapshot.get("stack", fit_result.get("stack_snapshot"))
+        materials = snapshot.get("materials", fit_result.get("materials_snapshot"))
         sim = fit_result.get("simulation") or {}
         psf_diag = fit_result.get("psf_diagnostics") or {}
         fit_diag = fit_result.get("fit_diagnostics") or {}
@@ -1908,13 +2305,15 @@ class StackDesignerApp:
         short_range_parameter_um = fwhm_um / GAUSSIAN_FWHM_FACTOR if fwhm_um > 0.0 else 0.0
         return {
             "program_name": PROGRAM_NAME,
-            "program_version": PROGRAM_VERSION,
+            "program_version": sim.get("program_version", "unknown"),
+            "exporter_version": PROGRAM_VERSION,
             "creator": PROGRAM_CREATOR,
             "export_time": time.strftime("%Y-%m-%d %H:%M:%S"),
             "python_version": sys.version.split()[0],
             "schema_version": PROJECT_SCHEMA_VERSION,
-            "stack_hash": _stable_json_hash(stack),
-            "material_library_hash": _stable_json_hash(materials),
+            "stack_hash": _stable_json_hash(stack) if stack is not None else None,
+            "material_library_hash": _stable_json_hash(materials) if materials is not None else None,
+            "input_state_status": self._fit_state(fit_result),
             "beam_energy_keV": fit_result.get("beam_energy_keV", sim.get("beam_energy_keV")),
             "number_of_electrons": sim.get("electrons"),
             "random_seed": sim.get("seed"),
@@ -1923,7 +2322,9 @@ class StackDesignerApp:
             "beamer_output_length_unit": BEAMER_LENGTH_UNIT,
             "psf_normalization": psf_diag.get("normalization", "area_density_integral_1"),
             "psf_integral": psf_diag.get("psf_integral"),
-            "gaussian_convention": GAUSSIAN_CONVENTION,
+            "gaussian_convention": fit_result.get("gaussian_convention", LEGACY_GAUSSIAN_CONVENTION),
+            "transport_diagnostics": copy.deepcopy(fit_result.get("transport_diagnostics", {})),
+            "stopping_model": sim.get("stopping_model", "unknown"),
             "short_range_parameter_nm": um_to_nm(short_range_parameter_um),
             "short_range_fwhm_nm": um_to_nm(fwhm_um),
             "short_range_fwhm_um": fwhm_um,
@@ -1971,7 +2372,7 @@ class StackDesignerApp:
                 if len(parts) != 2:
                     raise ValueError("PSF text export validation failed: expected two columns.")
                 r_um, value = float(parts[0]), float(parts[1])
-                if not (math.isfinite(r_um) and math.isfinite(value) and r_um > 0.0 and value > 0.0):
+                if not (math.isfinite(r_um) and math.isfinite(value) and r_um >= 0.0 and value > 0.0):
                     raise ValueError("PSF text export validation failed: non-positive or non-finite value.")
                 if r_um <= last_r:
                     raise ValueError("PSF text export validation failed: radii are not strictly increasing.")
@@ -2041,71 +2442,49 @@ class StackDesignerApp:
             if i > 0 and x_val <= xs[i - 1]:
                 raise ValueError("LPSF export validation failed: radii are not strictly increasing.")
 
-    def _build_lpsf_curve_points(self, fit_result):
+    def _export_curve_data(self, fit_result):
+        """Full normalized PSF, with analytically bounded omitted tail mass."""
         _ensure_numpy()
-        plot_data = fit_result.get("plot_data") or {}
-        r_nm = np.asarray(plot_data.get("r_nm", []), dtype=float)
-        y_fit = np.asarray(plot_data.get("fitted_density", []), dtype=float)
-        if r_nm.size == 0 or y_fit.size != r_nm.size:
-            raise ValueError("Invalid PSF curve data.")
-
-        mask = np.isfinite(r_nm) & np.isfinite(y_fit) & (r_nm > 0) & (y_fit > 0)
-        r_nm = r_nm[mask]
-        y_fit = y_fit[mask]
-        if r_nm.size < 2:
-            raise ValueError("Not enough positive PSF points for LPSF export.")
-
-        order = np.argsort(r_nm)
-        r_nm = r_nm[order]
-        y_fit = y_fit[order]
-        r_unique, unique_idx = np.unique(r_nm, return_index=True)
-        r_nm = r_unique
-        y_fit = y_fit[unique_idx]
-        if r_nm.size < 2:
-            raise ValueError("Not enough unique PSF radii for LPSF export.")
-
-        points_per_decade = 50
-        step_factor = 10.0 ** (1.0 / points_per_decade)
-        r_start_nm = 1.0
-        r_max_nm = max(r_start_nm * step_factor, float(r_nm[-1]))
-        decades = max(0.0, math.log10(r_max_nm / r_start_nm))
-        n_grid = int(math.ceil(decades * points_per_decade)) + 1
-        n_grid = max(2, min(1200, n_grid))
-        grid_r = r_start_nm * (step_factor ** np.arange(n_grid, dtype=float))
-        grid_r = grid_r[grid_r <= r_max_nm * (1.0 + 1e-12)]
-        if grid_r.size == 0:
-            grid_r = np.asarray([r_start_nm], dtype=float)
-        if grid_r[-1] < r_max_nm * 0.995:
-            grid_r = np.append(grid_r, r_max_nm)
-
-        log_r_src = np.log(np.clip(r_nm, 1e-300, None))
-        log_y_src = np.log(np.clip(y_fit, 1e-300, None))
-        log_y_grid = np.interp(np.log(grid_r), log_r_src, log_y_src, left=log_y_src[0], right=log_y_src[-1])
-        y_grid = np.exp(log_y_grid)
-
-        # LPSF curves are relative PSFs. Scale the numerical shape to a stable
-        # archive magnitude similar to mcTrace files; BEAMER normalizes on import.
-        if grid_r.size > 1:
-            integrand = 2.0 * math.pi * grid_r * y_grid
-            if hasattr(np, "trapezoid"):
-                ring_integral = float(np.trapezoid(integrand, grid_r))
-            else:
-                dr = grid_r[1:] - grid_r[:-1]
-                ring_integral = float(np.sum(0.5 * (integrand[1:] + integrand[:-1]) * dr))
-        else:
-            ring_integral = float(y_grid[0])
-        scale = 1.0e9 / ring_integral if ring_integral > 0 and math.isfinite(ring_integral) else 1.0e9
-        y_grid = y_grid * scale
-
-        points = [(0.0, float(y_grid[0]))]
-        points.extend((float(x), float(y)) for x, y in zip(grid_r, y_grid))
-        points.append((float(grid_r[-1] * step_factor), 0.0))
-        return points, {
-            "points_per_decade": points_per_decade,
-            "scale": scale,
-            "scaled_integral": ring_integral * scale,
-            "r_max_nm": float(grid_r[-1]),
+        model = fit_result.get("fit_representation")
+        if not model or model.get("version") != PSF_REPRESENTATION_VERSION:
+            raise ValueError("This saved fit predates the full PSF representation. Rerun the simulation before numerical PSF export.")
+        tolerance = PSF_EXPORT_TAIL_TOLERANCE
+        radius = max(1.0, float(model["beta_nm"]), float(model.get("alpha_nm", 0.0)), float(model.get("core_radius_nm", 0.0)))
+        radius = min(radius, PSF_EXPORT_MAX_RADIUS_NM)
+        while _psf_model_tail_fraction(model, radius) > tolerance and radius < PSF_EXPORT_MAX_RADIUS_NM:
+            radius = min(2.0 * radius, PSF_EXPORT_MAX_RADIUS_NM)
+        tail = _psf_model_tail_fraction(model, radius)
+        if tail > tolerance:
+            raise ValueError(
+                f"The fitted PSF retains {tail:.3g} of its energy beyond {radius:.3g} nm. "
+                "Its power tail is too broad for controlled numerical export; increase simulation coverage or use another fit."
+            )
+        short_width = float(model.get("core_radius_nm", model.get("alpha_nm", 1.0)))
+        first_radius = max(1e-6, min(0.01, short_width / 100.0))
+        count = max(100, int(math.ceil(math.log10(radius / first_radius) * 80.0)) + 1)
+        grid_r = np.concatenate(([0.0], np.geomspace(first_radius, radius, count)))
+        density = _evaluate_psf_model(model, grid_r, include_amplitude=False)
+        return grid_r, density, {
+            "normalization": "full_plane_area_integral_one",
+            "omitted_tail_fraction": tail,
+            "tail_tolerance": tolerance,
+            "r_max_nm": radius,
+            "fit_amplitude": float(model.get("amplitude", 1.0)),
+            "extrapolated_beyond_fit_window": radius > float(fit_result.get("fit_window_max_nm", 0.0)),
         }
+
+    def _build_lpsf_curve_points(self, fit_result):
+        grid_r, density, metadata = self._export_curve_data(fit_result)
+        integrand = 2.0 * math.pi * grid_r * density
+        integrate = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+        integral = float(integrate(integrand, grid_r))
+        if not math.isfinite(integral) or integral <= 0.0:
+            raise ValueError("Exported PSF has an invalid radial integral.")
+        scale = 1.0e9 / integral
+        points = [(float(x), float(y * scale)) for x, y in zip(grid_r, density)]
+        # Do not append a fabricated zero. The endpoint has a bounded omitted mass.
+        metadata.update(points_per_decade=80, scale=scale, scaled_integral=integral * scale)
+        return points, metadata
 
     def _lpsf_comment_lines(
         self,
@@ -2142,6 +2521,10 @@ class StackDesignerApp:
             f"    MeshRZSpD:       {int(curve_meta.get('points_per_decade', 50))}",
             f"    MeshRZSizeZ/nm:  {self._lpsf_num(mesh_z_size_nm)}",
             f"    ExportScale:     {self._lpsf_num(curve_meta.get('scale', 0.0))}",
+            f"    PSFOmittedTailFraction: {self._lpsf_num(curve_meta.get('omitted_tail_fraction', 0.0))}",
+            f"    PSFTailTolerance: {self._lpsf_num(curve_meta.get('tail_tolerance', 0.0))}",
+            f"    PSFModelNormalization: {curve_meta.get('normalization', '')}",
+            f"    PSFFitAmplitude: {self._lpsf_num(curve_meta.get('fit_amplitude', 1.0))}",
             f"    InternalLengthUnit: {INTERNAL_LENGTH_UNIT}",
             f"    BeamerLengthUnit:   {BEAMER_LENGTH_UNIT}",
             f"    PSFNormalization:   {metadata.get('psf_normalization')}",
@@ -2331,10 +2714,13 @@ class StackDesignerApp:
                     raise ValueError("Electrons must be > 0.")
                 if params["max_radius_nm"] < 1000:
                     raise ValueError("Max radius must be >= 1000 nm.")
-                if params["forward_nm"] <= 0:
-                    raise ValueError("Forward split radius must be > 0.")
-                if params["beamer_fwhm_um"] < 0:
-                    raise ValueError("BEAMER short-range FWHM must be >= 0.")
+                _finite_input(params["forward_nm"], "Forward split radius", positive=True)
+                _finite_input(params["beamer_fwhm_um"], "BEAMER short-range FWHM")
+                _finite_input(params["min_energy_keV"], "Stopping energy", positive=True)
+                if params["min_energy_keV"] >= self.project["beam"]["energy_keV"]:
+                    raise ValueError("Stopping energy must be below the beam energy.")
+                if params["max_collisions_per_electron"] <= 0:
+                    raise ValueError("Max collisions / electron must be > 0.")
                 dlg.destroy()
                 self._run_standalone_mc_job(params)
             except Exception as exc:
@@ -2420,11 +2806,15 @@ class StackDesignerApp:
             )
             res["beamer_fwhm_um"] = float(params.get("beamer_fwhm_um", 0.03))
             res["simulation"] = {
-                "engine": "standalone_mc_rutherford_bethe_like",
+                "engine": "approximate_mc_material_local_v2",
+                "program_version": PROGRAM_VERSION,
+                "stopping_model": "legacy_0.65_JoyLuo_plus_0.35_range_0.72",
+                "transport_validation": "numerical_consistency_only_not_physically_calibrated",
                 "electrons": params["electrons"],
                 "seed": params["seed"],
                 "elapsed_s": time.time() - t0,
                 "max_collisions_per_electron": params["max_collisions_per_electron"],
+                "max_radius_nm": params["max_radius_nm"],
                 "min_energy_keV": params["min_energy_keV"],
                 "beamer_fwhm_um": float(params.get("beamer_fwhm_um", 0.03)),
                 "beam_energy_keV": self.project.get("beam", {}).get("energy_keV"),
@@ -2433,8 +2823,10 @@ class StackDesignerApp:
                 "collision_count_in_resist": sim["collision_count_in_resist"],
                 "segments_in_resist": sim["segments_in_resist"],
             }
-            self.last_fit_result = res
-            self._store_fit_result(res)
+            res["transport_diagnostics"] = copy.deepcopy(sim.get("transport_diagnostics", {}))
+            diagnostic_warnings = _transport_diagnostic_warnings(res["transport_diagnostics"])
+            res["warnings"] = list(dict.fromkeys((res.get("warnings") or []) + diagnostic_warnings))
+            res = self._store_fit_result(res)
             self._refresh_fit_info()
             self._show_fit_result_dialog(res)
             forward_txt = self._fit_forward_parameter_text(res, short=True)
@@ -2453,18 +2845,36 @@ class StackDesignerApp:
 
     def _simulate_standalone_radial_distribution(self, params):
         _ensure_numpy()
-        rng = random.Random(int(params["seed"]))
+
+        def integer_param(value, label, minimum=None):
+            if isinstance(value, bool):
+                raise ValueError(f"{label} must be a finite integer.")
+            if isinstance(value, int):
+                result = value
+            else:
+                try:
+                    number = float(value)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError(f"{label} must be a finite integer.") from exc
+                if not math.isfinite(number) or not number.is_integer():
+                    raise ValueError(f"{label} must be a finite integer.")
+                result = int(number)
+            if minimum is not None and result < minimum:
+                raise ValueError(f"{label} must be >= {minimum}.")
+            return result
+
+        rng = random.Random(integer_param(params["seed"], "Random seed"))
         stack = self.project.get("stack", [])
         if not stack:
             raise ValueError("Stack is empty.")
 
-        # Build layer geometry and MC properties.
+        # All entered layers remain finite; their roles do not change transport.
         layers = []
         z = 0.0
         for i, layer in enumerate(stack):
             t = float(layer.get("thickness_nm", 0) or 0.0)
-            if t < 0:
-                raise ValueError(f"Negative thickness in layer {i+1}.")
+            if not math.isfinite(t) or t <= 0.0:
+                raise ValueError(f"Thickness in layer {i+1} must be finite and > 0.")
             mat = self.get_material(layer["material_name"])
             props = _material_mc_properties(mat)
             layers.append({
@@ -2479,52 +2889,64 @@ class StackDesignerApp:
             })
             z += t
         total_stack_nm = z
-        if total_stack_nm <= 0:
-            raise ValueError("Total stack thickness must be > 0.")
+        if not math.isfinite(total_stack_nm):
+            raise ValueError("Total stack thickness must be finite.")
 
         resist_indices_raw = params.get("resist_layer_indices")
         if resist_indices_raw is None:
-            resist_indices = [int(params["resist_layer_index"])]
+            resist_indices = [integer_param(params["resist_layer_index"], "Resist layer index", 0)]
         else:
-            resist_indices = [int(i) for i in resist_indices_raw]
+            if not isinstance(resist_indices_raw, (list, tuple)):
+                raise ValueError("Resist layer indices must be a list of integers.")
+            resist_indices = [integer_param(i, "Resist layer index", 0) for i in resist_indices_raw]
         if not resist_indices:
             raise ValueError("No resist layer selected.")
+        if len(set(resist_indices)) != len(resist_indices):
+            raise ValueError("Resist layer indices must be unique.")
         for resist_idx in resist_indices:
             if resist_idx < 0 or resist_idx >= len(layers):
                 raise ValueError("Invalid resist layer index.")
         resist_layers = [layers[i] for i in resist_indices]
-        launch_props = resist_layers[0]["props"]
         resist_intervals = [(L["z0"], L["z1"]) for L in resist_layers]
         resist_thickness_nm = sum(float(L["thickness_nm"]) for L in resist_layers)
         resist_layer_name = " + ".join(L["name"] for L in resist_layers)
 
-        # Keep thin membrane-style substrates finite, but treat clearly bulk substrates as semi-infinite.
-        if (
-            layers
-            and str(layers[-1].get("role", "")).lower() == "substrate"
-            and float(layers[-1].get("thickness_nm", 0.0) or 0.0) >= 50000.0
-        ):
-            layers[-1]["z1"] = float("inf")
-
-        max_radius_nm = max(int(params["max_radius_nm"]), 1000)
+        max_radius_nm = integer_param(params["max_radius_nm"], "Max radius (nm)", 1000)
         rvals = np.arange(1, max_radius_nm + 1, dtype=float)
         evals = np.zeros_like(rvals)
 
         beam = self.project.get("beam", {})
         E0 = float(beam.get("energy_keV") or 0.0)
-        if E0 <= 0:
-            raise ValueError("Beam energy (keV) must be set and > 0.")
+        if not math.isfinite(E0) or E0 <= 0.0:
+            raise ValueError("Beam energy (keV) must be finite and > 0.")
         beam_diam_nm = float(beam.get("beam_diameter_nm") or 0.0)
-        beam_sigma_nm = max(0.0, beam_diam_nm / 2.355) if beam_diam_nm else 0.0
+        if not math.isfinite(beam_diam_nm) or beam_diam_nm < 0.0:
+            raise ValueError("Beam diameter (nm) must be finite and >= 0.")
+        beam_sigma_nm = beam_diam_nm / 2.355
 
-        ne = int(params["electrons"])
+        ne = integer_param(params["electrons"], "Electrons", 1)
+        try:
+            incident_energy_keV = ne * E0
+        except OverflowError as exc:
+            raise ValueError("Total incident energy must be finite.") from exc
+        if not math.isfinite(incident_energy_keV):
+            raise ValueError("Total incident energy must be finite.")
         min_energy_keV = float(params["min_energy_keV"])
-        max_coll = int(params["max_collisions_per_electron"])
-        if max_coll <= 0:
-            max_coll = 1000
+        if not math.isfinite(min_energy_keV) or not 0.0 < min_energy_keV < E0:
+            raise ValueError("Min energy must be finite and satisfy 0 < E_cut < beam energy.")
+        max_coll = integer_param(params["max_collisions_per_electron"], "Max collisions per electron", 1)
 
         collision_count_in_resist = 0
         segments_in_resist = 0
+        deposited_all_keV = 0.0
+        deposited_selected_keV = 0.0
+        deposited_selected_in_radius_keV = 0.0
+        termination_counts = {reason: 0 for reason in (
+            "energy_cutoff", "escaped_top", "escaped_bottom", "max_collisions", "radial_limit"
+        )}
+        terminal_energy_keV = dict.fromkeys(termination_counts, 0.0)
+        max_depth_nm = 0.0
+        max_radius_reached_nm = 0.0
         dr = 1.0
         progress_t0 = time.time()
         update_every = max(1, min(200, ne // 40))
@@ -2537,9 +2959,11 @@ class StackDesignerApp:
 
         def deposit_in_resist(x0, y0, x1, y1, zmid, dE, collision_flag=False):
             nonlocal collision_count_in_resist, segments_in_resist
+            nonlocal deposited_selected_keV, deposited_selected_in_radius_keV
             if not any(zmid >= z0 and zmid < z1 for z0, z1 in resist_intervals):
                 return
             if dE > 0:
+                deposited_selected_keV += dE
                 lateral_len = math.hypot(x1 - x0, y1 - y0)
                 sub_segments = min(8, max(1, int(lateral_len / 15.0)))
                 share = dE / sub_segments
@@ -2547,9 +2971,10 @@ class StackDesignerApp:
                     frac = (j + 0.5) / sub_segments
                     rx = x0 + (x1 - x0) * frac
                     ry = y0 + (y1 - y0) * frac
-                    idx = int(round(math.hypot(rx, ry) / dr))
+                    idx = _radial_bin_index(math.hypot(rx, ry), dr)
                     if 0 <= idx < len(evals):
                         evals[idx] += share
+                        deposited_selected_in_radius_keV += share
                 segments_in_resist += 1
             if collision_flag:
                 collision_count_in_resist += 1
@@ -2565,30 +2990,23 @@ class StackDesignerApp:
             zpos = 0.0
             direction = (0.0, 0.0, 1.0)
             E = E0
+            termination = None
+            max_radius_reached_nm = max(max_radius_reached_nm, math.hypot(x, y))
 
             for _ in range(max_coll):
-                if E <= min_energy_keV:
-                    break
                 li = layer_at_z(zpos)
                 if li is None:
-                    # If escaped above surface or beyond finite stack, stop.
+                    termination = "escaped_top" if zpos < 0 else "escaped_bottom"
                     break
                 L = layers[li]
                 P = L["props"]
-                role = str(L.get("role", "")).lower()
 
-                # Screened Rutherford-like elastic transport with a Kanaya-Okayama range scale.
-                mfp_nm = _elastic_mean_free_path_nm(E, P)
-                if role == "resist":
-                    mfp_nm *= 0.55
-                elif role in ("substrate", "metal", "adhesion"):
-                    mfp_nm *= 0.82
-                remaining_step = -mfp_nm * math.log(max(1e-12, 1.0 - rng.random()))
-
-                while remaining_step > 1e-9:
-                    role = str(L.get("role", "")).lower()
+                # Sample optical depth, not a distance tied to the launch layer.
+                remaining_optical_depth = -math.log(max(1e-12, 1.0 - rng.random()))
+                while remaining_optical_depth > 0.0:
+                    mfp_nm = _elastic_mean_free_path_nm(E, P)
+                    remaining_step = remaining_optical_depth * mfp_nm
                     ux, uy, uz = direction
-                    # Distance to current layer boundary along z.
                     if uz > 1e-12:
                         boundary_z = L["z1"]
                         dist_to_boundary = (boundary_z - zpos) / uz
@@ -2596,77 +3014,67 @@ class StackDesignerApp:
                         boundary_z = L["z0"]
                         dist_to_boundary = (boundary_z - zpos) / uz
                     else:
+                        boundary_z = zpos
                         dist_to_boundary = float("inf")
-                    if dist_to_boundary <= 1e-9:
-                        dist_to_boundary = float("inf")
+                    dist_to_boundary = max(0.0, dist_to_boundary)
+                    geometric_step = min(remaining_step, dist_to_boundary)
 
-                    step = remaining_step if remaining_step <= dist_to_boundary else dist_to_boundary
+                    # Freeze stopping within this segment, and shorten the segment
+                    # when its available energy is exhausted before the next event.
+                    stopping = _bethe_stopping_keV_per_nm(E, P) * (0.92 + 0.16 * rng.random())
+                    cutoff_step = (E - min_energy_keV) / stopping if stopping > 0.0 else float("inf")
+                    reaches_cutoff = cutoff_step <= geometric_step
+                    reaches_boundary = dist_to_boundary <= geometric_step and not reaches_cutoff
+                    step = min(geometric_step, cutoff_step)
                     x0, y0, z0 = x, y, zpos
                     x += ux * step
                     y += uy * step
                     zpos += uz * step
-
-                    # Bethe-inspired continuous slowing-down with a mild substrate/interface boost.
-                    stop_coeff = _bethe_stopping_keV_per_nm(E, P)
-                    if role == "resist":
-                        stop_coeff *= 1.08
-                    elif role in ("substrate", "metal", "adhesion"):
-                        z_ratio = P["zeff_af"] / max(launch_props["zeff_af"], 1.0)
-                        if z_ratio > 1.0:
-                            stop_coeff *= 1.0 + 0.08 * min(3.0, z_ratio - 1.0)
-                    dE = min(E - min_energy_keV, max(0.0, stop_coeff * step * (0.92 + 0.16 * rng.random())))
-                    if dE < 0:
-                        dE = 0.0
+                    dE = E - min_energy_keV if reaches_cutoff else stopping * step
                     E -= dE
+                    deposited_all_keV += dE
                     zmid = 0.5 * (z0 + zpos)
                     deposit_in_resist(x0, y0, x, y, zmid, dE, collision_flag=False)
+                    max_depth_nm = max(max_depth_nm, zpos)
+                    max_radius_reached_nm = max(max_radius_reached_nm, math.hypot(x, y))
+                    remaining_optical_depth = max(0.0, remaining_optical_depth - step / mfp_nm)
 
-                    remaining_step -= step
+                    if reaches_cutoff:
+                        E = min_energy_keV
+                        termination = "energy_cutoff"
+                        break
 
-                    # Boundary crossing (no scattering event yet).
-                    if step == dist_to_boundary:
-                        # Move slightly inside next layer to avoid sticking on boundary.
-                        if uz > 0:
-                            zpos += 1e-6
-                        elif uz < 0:
-                            zpos -= 1e-6
-                        if zpos < -1.0:  # escaped upward
-                            remaining_step = 0.0
-                            break
+                    if reaches_boundary:
+                        # A one-ULP nudge avoids skipping an ultrathin neighboring layer.
+                        zpos = math.nextafter(boundary_z, math.inf if uz > 0 else -math.inf)
                         next_li = layer_at_z(zpos)
                         if next_li is None:
-                            remaining_step = 0.0
+                            termination = "escaped_top" if uz < 0 else "escaped_bottom"
                             break
                         li = next_li
                         L = layers[li]
                         P = L["props"]
                         continue
 
-                    # Collision occurs at end of remaining path segment.
+                    # An elastic event occurs after consuming the sampled optical depth.
                     deposit_in_resist(x0, y0, x, y, zpos, 0.0, collision_flag=True)
-
-                    z_ratio = P["zeff_af"] / max(launch_props["zeff_af"], 1.0)
-                    theta = _screened_rutherford_theta(P["zeff_af"] * max(1.0, z_ratio ** 0.2), E, rng)
-                    if role in ("substrate", "metal", "adhesion"):
-                        theta = min(math.pi * 0.97, theta * 1.08)
+                    theta = _screened_rutherford_theta(P["zeff_af"], E, rng)
                     phi = 2.0 * math.pi * rng.random()
                     direction = _scatter_direction(direction, theta, phi)
-                    remaining_step = 0.0
+                    remaining_optical_depth = 0.0
 
-                if E <= min_energy_keV:
+                if termination is not None:
                     break
-                if zpos < 0 and direction[2] < 0:
-                    break
-                # Hard radial cutoff to keep runtime bounded in extreme cases.
-                if (x * x + y * y) ** 0.5 > max_radius_nm * 4:
+                if math.hypot(x, y) > max_radius_nm * 4:
+                    termination = "radial_limit"
                     break
 
+            if termination is None:
+                termination = "max_collisions"
+            termination_counts[termination] += 1
+            terminal_energy_keV[termination] += E
             done = ie + 1
             if done % update_every == 0 or ie == ne - 1:
-                elapsed_s = time.time() - progress_t0
-                rate = done / elapsed_s if elapsed_s > 1e-9 else 0.0
-                eta_s = (ne - done) / rate if rate > 1e-9 else float("nan")
-                frac = done / ne if ne > 0 else 0.0
                 self._set_sim_progress_text(
                     "Standalone MC",
                     done,
@@ -2682,6 +3090,21 @@ class StackDesignerApp:
                 "Check stack order/role and resist thickness."
             )
 
+        transport_diagnostics = {
+            "incident_energy_keV": incident_energy_keV,
+            "deposited_energy_all_materials_keV": deposited_all_keV,
+            "deposited_energy_selected_resist_keV": deposited_selected_keV,
+            "deposited_energy_selected_in_radius_keV": deposited_selected_in_radius_keV,
+            "deposited_energy_selected_outside_radius_keV": max(0.0, deposited_selected_keV - deposited_selected_in_radius_keV),
+            "escaped_energy_keV": terminal_energy_keV["escaped_top"] + terminal_energy_keV["escaped_bottom"],
+            "residual_energy_at_cutoff_keV": terminal_energy_keV["energy_cutoff"],
+            "residual_energy_max_collisions_keV": terminal_energy_keV["max_collisions"],
+            "residual_energy_radial_limit_keV": terminal_energy_keV["radial_limit"],
+            "energy_balance_error_keV": incident_energy_keV - deposited_all_keV - math.fsum(terminal_energy_keV.values()),
+            "termination_counts": termination_counts,
+            "max_depth_nm": max_depth_nm,
+            "max_radius_reached_nm": max_radius_reached_nm,
+        }
         return {
             "rvals_nm": rvals,
             "evals": evals,
@@ -2692,6 +3115,7 @@ class StackDesignerApp:
             "segments_in_resist": int(segments_in_resist),
             "resist_thickness_nm": float(resist_thickness_nm),
             "beam_sigma_nm": float(beam_sigma_nm),
+            "transport_diagnostics": transport_diagnostics,
         }
 
     def _histogram_psf_diagnostics(self, rvals_nm, evals, ring_area_nm2, psf_density):
@@ -2926,10 +3350,7 @@ class StackDesignerApp:
         warnings.extend(fit_diag.get("warnings", []))
         warnings.extend(self._fit_parameter_warnings(best, beamer_fit))
 
-        dr = 1.0
-        fwd_idx = int(max(1, min(len(ev) - 2, round(float(forward_nm) / dr))))
-        fwd = float(ev[1:fwd_idx + 1].sum())
-        back = float(ev[fwd_idx + 1:].sum())
+        fwd, back = _radial_energy_split(rvals, ev, float(forward_nm))
         eta_split = back / fwd if fwd > 0 else float("nan")
 
         out = {
@@ -2945,8 +3366,11 @@ class StackDesignerApp:
             "fit_mse": best["mse"],
             "fit_unweighted_mse_log10": fit_diag["fit_unweighted_mse_log10"],
             "fit_max_abs_log10_residual": fit_diag["fit_max_abs_log10_residual"],
+            "fit_representation": dict(best["fit_representation"]),
             "plot_data": {
                 "r_nm": best["plot_r_nm"],
+                "ring_area_nm2": fit_ring_area.tolist(),
+                "sample_representation": "annular_area_average_at_outer_radius",
                 "measured_density": best["plot_measured_density"],
                 "fitted_density": best["plot_fitted_density"],
                 "beamer_gaussian_density": beamer_plot_density.tolist(),
@@ -3213,6 +3637,20 @@ class StackDesignerApp:
                 f"Unweighted MSE (log10 density): {float(fit_diag.get('fit_unweighted_mse_log10', float('nan'))):.6g}\n"
                 f"Max |log10 residual|: {float(fit_diag.get('fit_max_abs_log10_residual', float('nan'))):.6g}"
             )
+        transport = res.get("transport_diagnostics") or {}
+        if transport:
+            counts = transport.get("termination_counts", {})
+            diag_txt += (
+                "\n\nTransport energy accounting\n"
+                f"Incident energy: {transport.get('incident_energy_keV', 0.0):.6g} keV\n"
+                f"Deposited in all layers: {transport.get('deposited_energy_all_materials_keV', 0.0):.6g} keV\n"
+                f"Selected-resist energy outside histogram: {transport.get('deposited_energy_selected_outside_radius_keV', 0.0):.6g} keV\n"
+                f"Escaped energy: {transport.get('escaped_energy_keV', 0.0):.6g} keV\n"
+                f"Residual at energy cutoff: {transport.get('residual_energy_at_cutoff_keV', 0.0):.6g} keV\n"
+                f"Residual at collision/radial limits: {transport.get('residual_energy_max_collisions_keV', 0.0) + transport.get('residual_energy_radial_limit_keV', 0.0):.6g} keV\n"
+                f"Energy balance error: {transport.get('energy_balance_error_keV', 0.0):.3g} keV\n"
+                + "Trajectories: " + ", ".join(f"{key}={value}" for key, value in counts.items())
+            )
         warning_txt = ""
         if warnings:
             warning_txt = "\n\nWarnings\n" + "\n".join(f"- {w}" for w in warnings)
@@ -3258,7 +3696,7 @@ class StackDesignerApp:
         short_range_param_um = fwhm_um / GAUSSIAN_FWHM_FACTOR if fwhm_um > 0 else 0.0
         return (
             "\n\nBEAMER Gaussian Approximation (um)\n"
-            f"Gaussian convention: {GAUSSIAN_CONVENTION}\n"
+            f"Gaussian convention: {res.get('gaussian_convention', LEGACY_GAUSSIAN_CONVENTION)}\n"
             f"Alpha [um]: {alpha_um:.6f}\n"
             f"Beta [um]: {beta_um:.6f}\n"
             f"Eta: {eta:.6f}\n"
@@ -3293,14 +3731,67 @@ class StackDesignerApp:
             f"FWHM={fwhm_um:.6f}"
         )
 
+    def _fit_input_snapshot(self, fit_result):
+        snapshot = fit_result.get("input_snapshot")
+        if isinstance(snapshot, dict) and all(key in snapshot for key in ("beam", "materials", "stack")):
+            return snapshot
+        return None
+
+    def _input_signature(self, snapshot):
+        # Ignore display units and unused library entries. Round only the
+        # comparison fingerprint to avoid repeated-normalization roundoff making
+        # a newly loaded/canonicalized result appear stale.
+        names = {layer["material_name"] for layer in snapshot["stack"]}
+        beam = snapshot["beam"]
+        values = {
+            "beam": {key: beam.get(key) for key in ("energy_keV", "beam_diameter_nm", "current_pA")},
+            "stack": snapshot["stack"],
+            "materials": sorted((mat for mat in snapshot["materials"] if mat["name"] in names), key=lambda mat: mat["name"]),
+        }
+        def stable(value):
+            if isinstance(value, float):
+                return float(f"{value:.12g}")
+            if isinstance(value, dict):
+                return {key: stable(item) for key, item in value.items() if key not in ("alias", "notes")}
+            if isinstance(value, list):
+                return [stable(item) for item in value]
+            return value
+        return _stable_json_hash(stable(values))
+
+    def _fit_state(self, fit_result):
+        snapshot = self._fit_input_snapshot(fit_result)
+        if snapshot is None:
+            return "legacy_missing_snapshot"
+        current = {"beam": self.project.get("beam", {}), "materials": self.materials, "stack": self.project.get("stack", [])}
+        try:
+            if all(hasattr(self, name) for name in ("energy_var", "diam_var", "current_var", "current_unit_var")):
+                current["beam"] = self._beam_from_fields()
+            current = _validated_inputs(current)
+            return "current" if self._input_signature(snapshot) == self._input_signature(current) else "stale"
+        except (ValueError, TypeError, KeyError):
+            return "invalid_inputs"
+
+    def _require_exportable_fit(self, fit_result):
+        state = self._fit_state(fit_result)
+        if state == "legacy_missing_snapshot":
+            raise ValueError("This legacy result has no complete input snapshot. Run Simulation + Fit again before export.")
+        if state != "current":
+            raise ValueError("The inputs have changed or are invalid since this fit. Run Simulation + Fit again before export. The historical result remains available for inspection.")
+
     def _store_fit_result(self, res):
-        fit_record = dict(res)
-        fit_record["beam"] = dict(self.project.get("beam", {}))
-        fit_record["stack_snapshot"] = [dict(layer) for layer in self.project.get("stack", [])]
+        fit_record = copy.deepcopy(res)
+        snapshot = _validated_inputs(self.project)
+        fit_record["input_snapshot"] = snapshot
+        # Keep legacy keys as detached copies for readers of older JSON files.
+        fit_record["beam"] = copy.deepcopy(snapshot["beam"])
+        fit_record["stack_snapshot"] = copy.deepcopy(snapshot["stack"])
+        fit_record["materials_snapshot"] = copy.deepcopy(snapshot["materials"])
         fits = self.project.setdefault("pec_fits", [])
         fits.append(fit_record)
         if len(fits) > 50:
             del fits[:-50]
+        self.last_fit_result = copy.deepcopy(fit_record)
+        return self.last_fit_result
 
     def _refresh_fit_info(self):
         fits = self.project.get("pec_fits", [])
@@ -3308,9 +3799,11 @@ class StackDesignerApp:
             self.fit_info_var.set("No PEC fit yet.")
             return
         last = fits[-1]
+        state = self._fit_state(last)
+        status = "" if state == "current" else f" [{state.replace('_', ' ')}; rerun before export]"
         forward_txt = self._fit_forward_parameter_text(last, short=True)
         self.fit_info_var.set(
-            "Last PEC fit: "
+            "Last PEC fit" + status + ": "
             f"{forward_txt}, "
             f"beta={last.get('beta_nm', float('nan')):.2f} nm, "
             f"eta={last.get('eta_fit', float('nan')):.4f}, "
@@ -3347,13 +3840,11 @@ class StackDesignerApp:
             best_local = None
             x2 = x * x
             for a in alphas:
-                ea = np.exp(-x2 / (a * a))
-                ea /= max(float(np.sum(ea * ring_area)), 1e-300)
+                ea = _gaussian_ring_psf(x, ring_area, a)
                 for b in betas:
                     if b <= a * 1.05:
                         continue
-                    eb = np.exp(-x2 / (b * b))
-                    eb /= max(float(np.sum(eb * ring_area)), 1e-300)
+                    eb = _gaussian_ring_psf(x, ring_area, b)
                     et = etas[:, None]
                     pred_shape = (ea[None, :] + et * eb[None, :]) / (1.0 + et)
                     log_pred = np.log10(np.clip(pred_shape, 1e-300, None))
@@ -3374,6 +3865,9 @@ class StackDesignerApp:
                             "plot_measured_density": (10 ** y).tolist(),
                             "plot_fitted_density": pred_best.tolist(),
                         }
+                        best_local["fit_representation"] = _fit_representation(
+                            best_local, 10.0 ** offsets[j],
+                        )
             return best_local
 
         coarse = score_grid(
@@ -3387,7 +3881,7 @@ class StackDesignerApp:
             np.geomspace(max(100.0, b0 / 4), min(140000.0, b0 * 4), 56),
             np.geomspace(max(1e-3, e0 / 5), e0 * 5, 50),
         )
-        return refined
+        return min((coarse, refined), key=lambda candidate: candidate["mse"])
 
     def _fit_beamer_gaussian_grid(
         self,
@@ -3412,7 +3906,10 @@ class StackDesignerApp:
         seed_alpha = max(1.0, seed_alpha)
         seed_beta = max(seed_alpha * 3.0, seed_beta)
 
-        # Downsample for a fast BEAMER-oriented fit while keeping log-spaced radius coverage.
+        full_x, full_y, full_weights = x.copy(), y.copy(), weights.copy()
+        full_area = ring_area.copy()
+        # Only search samples are thinned; analytic component normalization is global.
+        # Final amplitude and diagnostics are always evaluated on the full input grid.
         if x.size > 650:
             idx = np.unique(np.round(np.geomspace(1, x.size - 1, 650)).astype(int))
             x = x[idx]
@@ -3425,9 +3922,7 @@ class StackDesignerApp:
         wsum = max(float(np.sum(weights)), 1e-300)
 
         def normalized_gaussian(width_nm):
-            comp = np.exp(-x2 / max(float(width_nm) ** 2, 1e-24))
-            comp /= max(float(np.sum(comp * ring_area)), 1e-300)
-            return comp
+            return _gaussian_ring_psf(x, ring_area, width_nm)
 
         def score_grid(alpha_grid, gamma_grid, beta_grid, eta_grid, nue_grid):
             best_local = None
@@ -3484,7 +3979,7 @@ class StackDesignerApp:
             np.geomspace(0.003, 3.0, 14),
         )
         if coarse is None:
-            return {
+            fallback = {
                 "alpha_nm": seed_alpha,
                 "beta_nm": seed_beta,
                 "eta_fit": seed_eta,
@@ -3494,6 +3989,8 @@ class StackDesignerApp:
                 "nue2": 0.0,
                 "mse": float(seed.get("mse", float("nan"))),
             }
+            fallback["fit_representation"] = _fit_representation(fallback)
+            return fallback
 
         refined = score_grid(
             np.geomspace(max(1.0, coarse["alpha_nm"] / 1.8), coarse["alpha_nm"] * 1.8, 11),
@@ -3502,53 +3999,28 @@ class StackDesignerApp:
             np.geomspace(max(1e-4, coarse["eta_fit"] / 4.0), coarse["eta_fit"] * 4.0, 16),
             np.geomspace(max(1e-4, coarse["nue1"] / 4.0), coarse["nue1"] * 4.0, 14),
         )
-        return refined or coarse
+        candidates = [candidate for candidate in (coarse, refined) if candidate is not None]
+        for candidate in candidates:
+            model = _fit_representation(candidate)
+            log_shape = np.log10(np.clip(_evaluate_psf_ring_average(model, full_x, full_area), 1e-300, None))
+            offset = float(np.sum(full_weights * (full_y - log_shape)) / np.sum(full_weights))
+            model["amplitude"] = 10.0 ** offset
+            candidate["search_mse"] = candidate["mse"]
+            candidate["mse"] = float(np.sum(full_weights * (log_shape + offset - full_y) ** 2) / np.sum(full_weights))
+            candidate["fit_representation"] = model
+        return min(candidates, key=lambda candidate: candidate["mse"])
 
     def _beamer_gaussian_density(
-        self,
-        x_nm,
-        ring_area,
-        beamer_fit,
-        target_y_log10_density=None,
-        fit_weights=None,
+        self, x_nm, ring_area, beamer_fit,
+        target_y_log10_density=None, fit_weights=None,
     ):
         _ensure_numpy()
-        x = np.asarray(x_nm, dtype=float)
-        area = np.asarray(ring_area, dtype=float)
-        x2 = x * x
-
-        def normalized_gaussian(width_nm):
-            comp = np.exp(-x2 / max(float(width_nm) ** 2, 1e-24))
-            comp /= max(float(np.sum(comp * area)), 1e-300)
-            return comp
-
-        alpha = normalized_gaussian(float(beamer_fit.get("alpha_nm", 1.0) or 1.0))
-        beta = normalized_gaussian(float(beamer_fit.get("beta_nm", 1000.0) or 1000.0))
-        gamma1_nm = float(beamer_fit.get("gamma1_nm", 0.0) or 0.0)
-        gamma2_nm = float(beamer_fit.get("gamma2_nm", 0.0) or 0.0)
-        eta = max(0.0, float(beamer_fit.get("eta_fit", 0.0) or 0.0))
-        nue1 = max(0.0, float(beamer_fit.get("nue1", 0.0) or 0.0))
-        nue2 = max(0.0, float(beamer_fit.get("nue2", 0.0) or 0.0))
-        numerator = alpha + eta * beta
-        denom = 1.0 + eta
-        if gamma1_nm > 0.0 and nue1 > 0.0:
-            numerator = numerator + nue1 * normalized_gaussian(gamma1_nm)
-            denom += nue1
-        if gamma2_nm > 0.0 and nue2 > 0.0:
-            numerator = numerator + nue2 * normalized_gaussian(gamma2_nm)
-            denom += nue2
-        density = numerator / max(denom, 1e-300)
-
-        if target_y_log10_density is not None:
-            target = np.asarray(target_y_log10_density, dtype=float)
-            weights = np.ones_like(x) if fit_weights is None else np.asarray(fit_weights, dtype=float)
-            log_density = np.log10(np.clip(density, 1e-300, None))
-            offset = float(
-                np.sum(weights * (target - log_density))
-                / max(float(np.sum(weights)), 1e-300)
-            )
-            density = density * (10.0 ** offset)
-        return density
+        model = beamer_fit.get("fit_representation")
+        if model is None:
+            raise ValueError("Legacy Gaussian fit has no global normalization metadata; rerun the fit.")
+        # The fitted amplitude is part of the representation. Do not refit it when
+        # evaluating another grid, otherwise a displayed curve differs from its fit.
+        return _evaluate_psf_ring_average(model, x_nm, ring_area)
 
     def _fit_power_gaussian_grid(
         self,
@@ -3572,9 +4044,7 @@ class StackDesignerApp:
             raise ValueError("Fit weights/window mismatch.")
         wsum = max(float(np.sum(weights)), 1e-300)
 
-        x2 = x * x
         beam_floor_nm = max(1.0, 0.5 * float(beam_sigma_nm or 0.0))
-        xeff = np.sqrt(x2 + beam_floor_nm * beam_floor_nm)
         beta_center_nm = _projected_backscatter_beta_nm(beam_energy_keV)
         beta_lo = max(200.0, beta_center_nm / 5.0)
         beta_hi = min(140000.0, max(8000.0, beta_center_nm * 3.5))
@@ -3583,11 +4053,9 @@ class StackDesignerApp:
         def score_grid(alpha_powers, betas, etas):
             best_local = None
             for aexp in alpha_powers:
-                pow_comp = xeff ** (-aexp)
-                pow_comp /= max(float(np.sum(pow_comp * ring_area)), 1e-300)
+                pow_comp = _power_ring_psf(x, ring_area, aexp, beam_floor_nm)
                 for b in betas:
-                    gauss_comp = np.exp(-x2 / (b * b))
-                    gauss_comp /= max(float(np.sum(gauss_comp * ring_area)), 1e-300)
+                    gauss_comp = _gaussian_ring_psf(x, ring_area, b)
                     et = etas[:, None]
                     pred_shape = (pow_comp[None, :] + et * gauss_comp[None, :]) / (1.0 + et)
                     log_pred = np.log10(np.clip(pred_shape, 1e-300, None))
@@ -3608,12 +4076,16 @@ class StackDesignerApp:
                             "plot_measured_density": (10 ** y).tolist(),
                             "plot_fitted_density": pred_best.tolist(),
                         }
+                        best_local["fit_representation"] = _fit_representation(
+                            best_local, 10.0 ** offsets[j],
+                            core_radius_nm=beam_floor_nm,
+                        )
             return best_local
 
         if high_energy_thin:
-            alpha_range = np.geomspace(1.8, 3.2, 26)
+            alpha_range = np.geomspace(2.01, 3.2, 26)
         else:
-            alpha_range = np.geomspace(1.2, 3.0, 24)
+            alpha_range = np.geomspace(2.01, 3.0, 24)
 
         coarse = score_grid(
             alpha_range,
@@ -3622,11 +4094,11 @@ class StackDesignerApp:
         )
         a0, b0, e0 = coarse["alpha_power"], coarse["beta_nm"], coarse["eta_fit"]
         refined = score_grid(
-            np.geomspace(max(1.05, a0 / 1.35), min(4.0, a0 * 1.35), 28),
+            np.geomspace(max(2.01, a0 / 1.35), min(4.0, a0 * 1.35), 28),
             np.geomspace(max(150.0, b0 / 3.0), min(160000.0, b0 * 3.0), 48),
             np.geomspace(max(1e-3, e0 / 4.0), e0 * 4.0, 36),
         )
-        return refined
+        return min((coarse, refined), key=lambda candidate: candidate["mse"])
 
     def plot_last_fit(self):
         if not self.last_fit_result:
@@ -3634,7 +4106,7 @@ class StackDesignerApp:
             if not fits:
                 messagebox.showinfo("Plot PEC Fit", "No PEC fit available yet.")
                 return
-            self.last_fit_result = fits[-1]
+            self.last_fit_result = copy.deepcopy(fits[-1])
 
         res = self.last_fit_result
         plot_data = res.get("plot_data")
@@ -3664,6 +4136,9 @@ class StackDesignerApp:
                 f"β={res.get('beta_nm', float('nan')):.2f} nm, η={res.get('eta_fit', float('nan')):.4f}"
             )
 
+        state = self._fit_state(res)
+        if state != "current":
+            title += f" [historical result: {state.replace('_', ' ')}]"
         mpl = _ensure_matplotlib_pyplot()
         fit_label = f"{self._fit_model_display_name(res)} fit"
         beamer_annotation = self._beamer_plot_annotation(res)

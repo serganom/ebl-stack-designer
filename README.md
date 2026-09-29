@@ -1,12 +1,12 @@
 # EBL Stack Designer
 
-EBL Stack Designer is a desktop Python/Tkinter application for electron-beam lithography stack design, approximate Monte Carlo-style electron transport, radial PSF extraction, and BEAMER-compatible proximity effect correction parameter generation.
+EBL Stack Designer is a desktop Python/Tkinter application for electron-beam lithography stack design, approximate Monte Carlo-style electron transport, radial PSF extraction, and proximity effect correction parameter generation intended for BEAMER workflows.
 
 Author: `Sergei Nomoev`
 
 Suggested GitHub repository description:
 
-`Python GUI for EBL multilayer stack design, approximate Monte Carlo PSF simulation, and BEAMER-compatible PEC export.`
+`Python GUI for EBL multilayer stack design, approximate Monte Carlo PSF simulation, and BEAMER-style PEC exports.`
 
 ## What It Is
 
@@ -37,9 +37,28 @@ Main stack-design and simulation interface:
 
 ![EBL Stack Designer GUI](docs/images/gui-stack-example.png)
 
-PEC fit plot with measured Monte Carlo histogram, selected physical fit, and BEAMER Gaussian approximation:
+PEC fit plot with simulated deposited-energy histogram, selected PSF fit, and BEAMER Gaussian approximation:
 
 ![PEC fit plot](docs/images/pec-fit-example.png)
+
+## Correctness update in 0.5.0
+
+Version 0.5.0 corrects interface transport, material composition,
+radial binning, annular-average fitting, global PSF normalization and result
+provenance. It records the primary-electron energy balance and limit truncation.
+Material mass fractions are the canonical composition input; layer thicknesses
+remain finite exactly as entered. See [the correctness review](docs/CORRECTNESS_REVIEW.md)
+for the reproduced failures and remaining physical-validation work.
+
+The screenshots above show version 0.5.0 and the saved 50 keV ma-N 2400 / Si₃N₄ / InP example.
+The [numerical check report](docs/validation/example-50keV.json) records its energy balance and internally validated exports.
+Export files pass internal roundtrip checks; import into BEAMER has not yet been independently verified.
+Rerun projects calculated with earlier versions before using their parameters or exporting a numerical PSF.
+Legacy plots remain identifiable, but stored window-normalized eta values are not
+silently converted to the new global convention.
+
+The 0.65/0.35 stopping blend is retained as an uncalibrated legacy approximation.
+Passing the numerical regression suite is not a claim of measured PEC accuracy.
 
 ## Current Highlights
 
@@ -57,9 +76,9 @@ PEC fit plot with measured Monte Carlo histogram, selected physical fit, and BEA
 - automatic noisy-tail cutoff during fit preparation
 - BEAMER Gaussian Approximation output in micrometers, including `Alpha`, `Beta`, `Eta`, `Gamma1`, and `Nue1`
 - editable BEAMER short-range blur FWHM value in the simulation dialog
-- BEAMER-ready micrometer parameters shown directly on the PEC fit plot
-- optional BEAMER Gaussian approximation curve shown on the same PEC plot as the selected physical fit
-- PSF curve export as BEAMER-compatible compressed `.lpsf`, simple two-column `.psf`, or full diagnostic `.csv`
+- estimated micrometer parameters for BEAMER workflows shown directly on the PEC fit plot
+- optional BEAMER Gaussian approximation curve shown on the same PEC plot as the selected PSF fit
+- PSF curve export as BEAMER-style compressed `.lpsf`, simple two-column `.psf`, or full diagnostic `.csv`
 - PSF normalization diagnostics, fit residual metrics, export metadata, and export roundtrip validation
 - legacy JSON migration with `schema_version`
 - no-GUI smoke test for fitting and export validation
@@ -176,11 +195,20 @@ The bundled launchers try to prefer a Python interpreter with working `tkinter`.
 
 ## Smoke Test
 
-Run the no-GUI engineering smoke test before publishing or after physics/export edits:
+Run the headless correctness regressions and complete workflow test, followed by the engineering export smoke test:
 
 ```bash
+python3 -m unittest discover -s tests -p "test_*.py" -v
 python3 tests/smoke_test.py
 ```
+
+Reproduce the 50 keV example (3000 electrons, seed 12345) with:
+
+```bash
+python3 tools/check_example.py --output example-check.json --project-output example-project.json --plot-output example-psf.png
+```
+
+This checks execution, energy accounting and internal export consistency; it is not an independent physical validation.
 
 ## Basic Workflow
 

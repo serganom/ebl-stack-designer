@@ -1,5 +1,6 @@
 import importlib.util
 import pathlib
+import math
 import tempfile
 import zlib
 import xml.etree.ElementTree as ET
@@ -57,12 +58,13 @@ def main():
     if legacy["schema_version"] != m.PROJECT_SCHEMA_VERSION or not warnings:
         raise AssertionError("Legacy JSON migration failed.")
 
-    physical = (
-        np.exp(-(r / 7.0) ** 2)
-        + 0.9 * np.exp(-(r / 3200.0) ** 2)
-    )
-    physical /= max(float(np.sum(physical * area)), 1e-300)
-    evals = physical * area
+    inner = r - 1.0
+    # Exact annular energies from globally normalized components; eta = 0.9.
+    evals = (
+        np.exp(-(inner / 7.0) ** 2) - np.exp(-(r / 7.0) ** 2)
+        + 0.9 * (np.exp(-(inner / 3200.0) ** 2) - np.exp(-(r / 3200.0) ** 2))
+    ) / 1.9
+    evals /= float(np.sum(evals))
     if not np.all(np.isfinite(evals)) or np.any(evals < 0):
         raise AssertionError("Synthetic histogram is invalid.")
 
@@ -78,6 +80,13 @@ def main():
         resist_material_name="PMMA bilayer",
         beam_sigma_nm=4.25,
     )
+    if res["fit_model"] != "double_gaussian":
+        raise AssertionError("Known double-Gaussian histogram selected the wrong family.")
+    for key, expected in (("alpha_nm", 7.0), ("beta_nm", 3200.0), ("eta_fit", 0.9)):
+        if abs(res[key] / expected - 1.0) > 0.15:
+            raise AssertionError(f"Synthetic parameter recovery failed for {key}: {res[key]}")
+    if res["fit_mse"] > 0.01:
+        raise AssertionError("Synthetic PSF fit has excessive log-density error.")
     res["beamer_fwhm_um"] = 0.03
     res["simulation"] = {
         "engine": "smoke",
@@ -106,6 +115,14 @@ def main():
     app._validate_psf_two_column_file(str(psf_path))
     app._validate_psf_csv_file(str(csv_path))
     app._validate_lpsf_file(str(lpsf_path))
+    exported = np.loadtxt(psf_path)
+    radius_nm = exported[:, 0] * 1000.0
+    density_nm2 = exported[:, 1] / 1e6
+    if radius_nm[0] != 0.0 or density_nm2[0] <= density_nm2[np.searchsorted(radius_nm, 3.0)]:
+        raise AssertionError("Full numerical PSF export lost its central profile.")
+    integrate = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+    integral = float(integrate(2.0 * math.pi * radius_nm * density_nm2, radius_nm))
+    assert_close(integral, 1.0, 0.002, "Exported full PSF integral")
     xml_text = zlib.decompress(lpsf_path.read_bytes()).decode("utf-8")
     root = ET.fromstring(xml_text)
     points = int(root.find(".//m_PSFDataOriginal/count").text)

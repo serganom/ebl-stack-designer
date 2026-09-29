@@ -1,0 +1,201 @@
+{
+  "purpose": "Numerical execution and conservation check; not independent physical or PEC process validation",
+  "program_version": "0.5.0",
+  "source_sha256": "44c364acdcb2d009bbec8dd951cd0c196f242d2b3052518529da24898d8844b2",
+  "report_provenance": {
+    "method": "Regenerated from the saved calculation using current evaluators and export methods; no Monte Carlo rerun",
+    "saved_project_file": "final-example-project.json",
+    "saved_project_sha256": "4869b0c6d719f70b78fdc60faa5684333777209e1f5387b72dcf2327ffd88972",
+    "calculation_program_version": "0.5.0",
+    "plot_model_check": "Saved annular model arrays reproduced by the production evaluator at rtol=2e-12",
+    "source_sha256_scope": "Current source used to re-evaluate the saved models and regenerate exports; no original Monte Carlo source hash is stored in the saved project."
+  },
+  "inputs": {
+    "beam": {
+      "energy_keV": 50.0,
+      "beam_diameter_nm": 0.0,
+      "current_pA": null,
+      "current_input_unit": "pA"
+    },
+    "materials": [
+      {
+        "name": "ma-N 2400 (approx.)",
+        "alias": "ma-N 2400",
+        "density_g_cm3": 1.1,
+        "notes": "Approximate negative novolak-based resist composition for Monte Carlo.",
+        "elements": [
+          {
+            "symbol": "C",
+            "Z": 6,
+            "weight_fraction": 0.65,
+            "atomic_fraction": 0.32014677978460526
+          },
+          {
+            "symbol": "H",
+            "Z": 1,
+            "weight_fraction": 0.1,
+            "atomic_fraction": 0.5868869004873158
+          },
+          {
+            "symbol": "O",
+            "Z": 8,
+            "weight_fraction": 0.24,
+            "atomic_fraction": 0.0887428457815435
+          },
+          {
+            "symbol": "N",
+            "Z": 7,
+            "weight_fraction": 0.01,
+            "atomic_fraction": 0.004223473946535407
+          }
+        ]
+      },
+      {
+        "name": "Silicon Nitride (Si3N4)",
+        "alias": "Si3N4; silicon nitride",
+        "density_g_cm3": 3.44,
+        "notes": "Stoichiometric Si3N4.",
+        "elements": [
+          {
+            "symbol": "Si",
+            "Z": 14,
+            "weight_fraction": 0.6006,
+            "atomic_fraction": 0.42856393120622627
+          },
+          {
+            "symbol": "N",
+            "Z": 7,
+            "weight_fraction": 0.3994,
+            "atomic_fraction": 0.5714360687937737
+          }
+        ]
+      },
+      {
+        "name": "InP",
+        "alias": "InP",
+        "density_g_cm3": 4.81,
+        "notes": "Stoichiometric InP substrate.",
+        "elements": [
+          {
+            "symbol": "In",
+            "Z": 49,
+            "weight_fraction": 0.788,
+            "atomic_fraction": 0.5006735679276312
+          },
+          {
+            "symbol": "P",
+            "Z": 15,
+            "weight_fraction": 0.212,
+            "atomic_fraction": 0.4993264320723689
+          }
+        ]
+      }
+    ],
+    "stack": [
+      {
+        "material_name": "ma-N 2400 (approx.)",
+        "thickness_nm": 500.0,
+        "role": "resist"
+      },
+      {
+        "material_name": "Silicon Nitride (Si3N4)",
+        "thickness_nm": 200.0,
+        "role": "dielectric"
+      },
+      {
+        "material_name": "InP",
+        "thickness_nm": 350000.0,
+        "role": "substrate"
+      }
+    ]
+  },
+  "simulation_parameters": {
+    "electrons": 3000,
+    "seed": 12345,
+    "min_energy_keV": 0.05,
+    "max_collisions_per_electron": 4000,
+    "max_radius_nm": 30000,
+    "resist_layer_index": 0,
+    "resist_layer_indices": [
+      0
+    ],
+    "forward_nm": 100.0
+  },
+  "elapsed_s": null,
+  "elapsed_s_note": "The saved project contains no elapsed time; no runtime is inferred from an earlier report.",
+  "transport_diagnostics": {
+    "incident_energy_keV": 150000.0,
+    "deposited_energy_all_materials_keV": 130330.96059804513,
+    "deposited_energy_selected_resist_keV": 1834.1067238570702,
+    "deposited_energy_selected_in_radius_keV": 1834.1067238571247,
+    "deposited_energy_selected_outside_radius_keV": 0.0,
+    "escaped_energy_keV": 19549.88940194037,
+    "residual_energy_at_cutoff_keV": 119.14999999999537,
+    "residual_energy_max_collisions_keV": 0.0,
+    "residual_energy_radial_limit_keV": 0.0,
+    "energy_balance_error_keV": 1.450462150387466e-08,
+    "termination_counts": {
+      "energy_cutoff": 2383,
+      "escaped_top": 617,
+      "escaped_bottom": 0,
+      "max_collisions": 0,
+      "radial_limit": 0
+    },
+    "max_depth_nm": 11018.050289267903,
+    "max_radius_reached_nm": 13014.18515202254
+  },
+  "relative_energy_balance_error": 9.669747669249773e-14,
+  "fit_representation": {
+    "version": 1,
+    "model": "power_gaussian",
+    "normalization": "full_plane_area_integral_one",
+    "eta_semantics": "global_component_integral_ratio",
+    "beta_nm": 5155.748347307582,
+    "eta": 0.6615441666494355,
+    "amplitude": 1.132853989805832,
+    "alpha_power": 2.9491473374803596,
+    "core_radius_nm": 1.0
+  },
+  "fit_weighted_mse_log10": 0.07233998557990653,
+  "fit_window_max_nm": 12338.0,
+  "psf_diagnostics": {
+    "normalization": "area_density_integral_1",
+    "internal_length_unit": "nm",
+    "density_unit": "1/nm^2",
+    "total_deposited_energy_keV": 1834.1067238570654,
+    "psf_integral": 1.0,
+    "cumulative_energy_r_max": 1.0000000000000042,
+    "r_max_nm": 30000.0,
+    "radial_bin_count": 30000,
+    "nonzero_bin_count": 7622,
+    "warnings": []
+  },
+  "warnings": [],
+  "exports": {
+    "psf": {
+      "bytes": 16291,
+      "validated": true,
+      "sha256": "04e15393c50ea5c6fde77be5a4f4c3cec774c04f8cd9abc3c67c171591f6792f"
+    },
+    "csv": {
+      "bytes": 1014158,
+      "validated": true,
+      "sha256": "6b7aeb5ad808d348348af310876d8905142bd83061a7729d319b3a9616566157"
+    },
+    "lpsf": {
+      "bytes": 13501,
+      "validated": true,
+      "sha256": "9414aa4087f938626901a5f22a753f559579f112720f0867488e60f3cfb8dca7"
+    },
+    "curve_domain": {
+      "normalization": "full_plane_area_integral_one",
+      "omitted_tail_fraction": 4.840997138275598e-05,
+      "tail_tolerance": 0.0001,
+      "r_max_nm": 20622.993389230327,
+      "fit_amplitude": 1.132853989805832,
+      "extrapolated_beyond_fit_window": true,
+      "point_count": 508,
+      "includes_zero_radius": true
+    }
+  }
+}
